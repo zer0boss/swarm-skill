@@ -1,8 +1,17 @@
-# Swarm v2.1.1 - 多智能体蜂群协作系统
+# Swarm v2.1.2 - 多智能体蜂群协作系统
 
 > 基于群体智能理论，实现黑板代理、状态托管、多轮迭代、量化共识
 
-**版本: v2.1.1** | 发布日期: 2026-02-18
+**版本: v2.1.2** | 发布日期: 2026-02-18
+
+### v2.1.2 更新内容
+
+| 问题 | 修复 |
+|------|------|
+| Web搜索卡住 | ✅ 新增搜索超时与降级机制 |
+| interrupted误判 | ✅ 新增Agent状态恢复机制 |
+| Agent空闲浪费 | ✅ 新增空闲碰撞机制（碰撞协议） |
+| 轮次中断恢复 | ✅ 新增轮次恢复机制 |
 
 ### v2.1.1 更新内容
 
@@ -1350,6 +1359,7 @@ T3: Synthesizer × 3, DeepAnalyst × 2, Debater × 1
 | v2.0 | 2026-02 | 数字信息素、交叉抑制、量化共识、动态角色、涌现分解 |
 | v2.1 | 2026-02-17 | 黑板代理、状态托管、多轮迭代、超时降级、角色触发器、StopSignal协议、独特Agent命名 |
 | v2.1.1 | 2026-02-18 | 强制清理机制、同步屏障、最少轮数限制、黑板操作执行清单、shutdown超时配置 |
+| v2.1.2 | 2026-02-18 | Web搜索降级、Agent状态恢复、空闲碰撞机制、轮次恢复机制 |
 
 ---
 
@@ -1678,4 +1688,447 @@ async function gracefulShutdown(agents) {
 
 ---
 
-*Swarm v2.1.1 - 基于群体智能理论的自组织协作系统*
+## 十四、v2.1.2 新增机制
+
+### 14.1 Web搜索超时与降级机制
+
+解决Agent在Web搜索时卡住的问题：
+
+```javascript
+const WEB_SEARCH_CONFIG = {
+  timeout: 30000,           // 单次搜索超时: 30秒
+  maxRetries: 2,            // 最大重试次数
+  fallbackEnabled: true,    // 启用降级
+  cacheEnabled: true,       // 启用缓存
+  cacheTTL: 3600000         // 缓存有效期: 1小时
+};
+
+// 搜索降级策略
+const SEARCH_FALLBACK_STRATEGY = {
+  // 1. 使用训练知识
+  useTrainingKnowledge: true,
+
+  // 2. 逻辑推理
+  enableLogicalInference: true,
+
+  // 3. 声明置信度
+  requireConfidenceLevel: true,
+
+  // 4. 标注待验证
+  markNeedsValidation: true
+};
+```
+
+**Agent Prompt 中的搜索指南**：
+
+```markdown
+## 搜索超时处理策略
+
+当Web搜索超时或失败时（30秒内必须响应），执行以下降级策略：
+
+### 降级步骤
+1. **立即响应**: 不要无限等待，30秒内必须有输出
+2. **使用缓存知识**: 基于你的训练知识回答
+3. **逻辑推理**: 基于已知信息进行推理
+4. **声明限制**: 明确说明"基于已有知识，建议后续验证"
+
+### 响应格式
+{
+  "coreIdea": "核心观点",
+  "perspective": "分析视角",
+  "details": "详细说明（注明：基于已有知识）",
+  "confidence": "medium",      // high/medium/low
+  "needsValidation": true,     // 建议后续验证
+  "searchAttempted": true      // 标记已尝试搜索
+}
+```
+
+---
+
+### 14.2 Agent状态恢复机制
+
+解决interrupted状态被误判为失败的问题：
+
+```javascript
+const AGENT_STATUS_CONFIG = {
+  // 状态定义（明确区分）
+  statusDefinitions: {
+    "active": {
+      description: "正在执行任务",
+      canRecover: false,
+      isFailed: false
+    },
+    "idle": {
+      description: "空闲，等待指令",
+      canRecover: false,
+      isFailed: false
+    },
+    "interrupted": {
+      description: "暂时中断，可能恢复",
+      canRecover: true,         // 可恢复！
+      isFailed: false,          // 不是失败！
+      recoveryTimeout: 60000    // 60秒内可恢复
+    },
+    "degraded": {
+      description: "性能下降，仍在工作",
+      canRecover: false,
+      isFailed: false
+    },
+    "terminated": {
+      description: "已终止",
+      canRecover: false,
+      isFailed: true
+    }
+  },
+
+  // 恢复策略
+  recoveryStrategy: {
+    waitForRecovery: 60000,     // 等待恢复时间: 60秒
+    sendPingInterval: 15000,    // 每15秒发送ping
+    escalateAfter: 120000,      // 120秒后升级为degraded
+    maxRecoveryAttempts: 3      // 最大恢复尝试次数
+  }
+};
+
+// 判断Agent是否真正失败
+function isAgentFailed(agentState) {
+  // interrupted不是失败，需要等待恢复
+  if (agentState.status === "interrupted") {
+    const timeSinceLastActive = Date.now() - agentState.lastActiveAt;
+    return timeSinceLastActive > AGENT_STATUS_CONFIG.recoveryStrategy.escalateAfter;
+  }
+  return agentState.status === "terminated";
+}
+
+// 恢复中断的Agent
+async function recoverInterruptedAgent(agentId) {
+  for (let attempt = 1; attempt <= AGENT_STATUS_CONFIG.recoveryStrategy.maxRecoveryAttempts; attempt++) {
+    // 发送恢复消息
+    await SendMessage({
+      type: "message",
+      recipient: agentId,
+      content: JSON.stringify({
+        type: "recovery_request",
+        attempt: attempt,
+        message: "请继续你的探索任务"
+      }),
+      summary: `恢复Agent: ${agentId} (尝试 ${attempt})`
+    });
+
+    // 等待响应
+    await sleep(AGENT_STATUS_CONFIG.recoveryStrategy.sendPingInterval);
+
+    // 检查是否恢复
+    const state = getAgentState(agentId);
+    if (state.status === "active" || state.status === "idle") {
+      return { recovered: true, agentId };
+    }
+  }
+
+  // 恢复失败，标记为degraded
+  await updateAgentStatus(agentId, "degraded");
+  return { recovered: false, agentId, newStatus: "degraded" };
+}
+```
+
+---
+
+### 14.3 空闲Agent碰撞机制
+
+让空闲的Agent与黑板上的发现进行"碰撞"，提升资源利用率：
+
+```javascript
+// 碰撞模式定义
+const COLLISION_MODES = {
+  // 模式1: 审查质疑
+  REVIEW_CHALLENGE: {
+    name: "review_challenge",
+    description: "审查其他Agent的发现，提出质疑或补充",
+    trigger: "agent_idle_with_findings",
+    priority: 1
+  },
+
+  // 模式2: 观点辩论
+  DEBATE: {
+    name: "debate",
+    description: "就某个有分歧的观点进行辩论",
+    trigger: "divergent_views_detected",
+    priority: 2
+  },
+
+  // 模式3: 协作深化
+  COLLABORATE_DEEPEN: {
+    name: "collaborate_deepen",
+    description: "共同深化某个高价值发现",
+    trigger: "high_pheromone_concentration",
+    priority: 3
+  },
+
+  // 模式4: 早期综合
+  EARLY_SYNTHESIS: {
+    name: "early_synthesis",
+    description: "尝试综合已有发现，生成草案",
+    trigger: "round_complete_waiting",
+    priority: 4
+  }
+};
+
+// 碰撞规则
+const COLLISION_RULES = {
+  maxSameDirectionAgents: 2,     // 同一方向最多2个Agent
+  encourageDivergence: true,     // 鼓励提出不同观点
+  collisionWeights: {
+    challenge: 1.5,              // 质疑权重最高
+    support: 0.8,                // 支持权重较低
+    extend: 1.2,                 // 延伸权重中等
+    synthesize: 1.0              // 综合权重标准
+  },
+  triggerConditions: {
+    minFindingsForCollision: 2,  // 至少2个发现
+    minIdleAgents: 1,            // 至少1个空闲Agent
+    maxCollisionPerRound: 3      // 每轮最多3次碰撞
+  }
+};
+```
+
+**碰撞消息协议**：
+
+```javascript
+// Orchestrator → 空闲Agent: 邀请碰撞
+{
+  "type": "collision_invitation",
+  "mode": "review_challenge" | "debate" | "collaborate_deepen" | "early_synthesis",
+  "targetFindings": [
+    { "id": "finding-001", "coreIdea": "...", "byAgent": "SuYuan" }
+  ],
+  "blackboardSnapshot": {
+    "pheromones": {...},
+    "findings": [...]
+  }
+}
+
+// Agent → Orchestrator: 碰撞响应
+{
+  "type": "collision_response",
+  "mode": "review_challenge",
+  "result": {
+    "targetFindingId": "finding-001",
+    "action": "challenge" | "support" | "extend" | "synthesize",
+    "content": "审查/质疑/补充内容",
+    "newInsights": ["新洞察1", "新洞察2"]
+  }
+}
+```
+
+**空闲Agent处理流程**：
+
+```javascript
+async function handleIdleAgents(blackboard, idleAgents) {
+  if (idleAgents.length === 0) return;
+
+  const findings = blackboard.metadata.findings;
+  if (findings.length < COLLISION_RULES.triggerConditions.minFindingsForCollision) {
+    return;  // 发现太少，无法碰撞
+  }
+
+  let collisionCount = 0;
+  for (let agent of idleAgents) {
+    if (collisionCount >= COLLISION_RULES.maxCollisionPerRound) break;
+
+    // 选择碰撞模式
+    const mode = selectCollisionMode(blackboard, agent);
+
+    // 选择目标发现
+    const targetFindings = selectTargetFindings(findings, agent, mode);
+
+    // 发送碰撞邀请
+    await SendMessage({
+      type: "collision_invitation",
+      recipient: agent.id,
+      content: JSON.stringify({
+        mode: mode,
+        targetFindings: targetFindings,
+        blackboardSnapshot: getBlackboardSnapshot(blackboard)
+      }),
+      summary: `碰撞邀请: ${mode}`
+    });
+
+    collisionCount++;
+  }
+}
+
+function selectCollisionMode(blackboard, agent) {
+  const pheromones = blackboard.metadata.pheromones;
+  const findings = blackboard.metadata.findings;
+
+  // 高浓度信息素 → 协作深化
+  const maxConc = Math.max(...Object.values(pheromones).map(p => p.concentration || 0), 0);
+  if (maxConc > 0.6) return "collaborate_deepen";
+
+  // 有分歧观点 → 辩论
+  const uniquePerspectives = new Set(findings.map(f => f.perspective));
+  if (uniquePerspectives.size > 2) return "debate";
+
+  // 默认 → 审查质疑
+  return "review_challenge";
+}
+```
+
+**Agent Prompt 中的碰撞指南**：
+
+```markdown
+## 空闲时碰撞行为
+
+当你收到 `collision_invitation` 消息时，根据模式执行：
+
+### 审查质疑模式 (review_challenge)
+1. 阅读目标发现
+2. 从你的视角评估：
+   - 是否有逻辑漏洞？
+   - 是否有遗漏视角？
+   - 是否需要补充证据？
+3. 选择 action: challenge / support / extend
+4. 提交你的审查意见
+
+### 协作深化模式 (collaborate_deepen)
+1. 阅读高价值方向的已有发现
+2. 贡献你独特的补充（避免重复）
+3. 可添加新案例、新数据、新推理
+
+### 辩论模式 (debate)
+1. 选择与你观点不同的发现
+2. 提出你的反驳或替代方案
+3. 提供支持你观点的论据
+
+### 响应格式
+{
+  "type": "collision_response",
+  "mode": "review_challenge",
+  "result": {
+    "targetFindingId": "finding-001",
+    "action": "challenge",
+    "content": "你的审查意见",
+    "newInsights": ["新洞察"]
+  }
+}
+```
+
+---
+
+### 14.4 轮次恢复机制
+
+当轮次因Agent中断而无法完成时，自动恢复：
+
+```javascript
+const ROUND_RECOVERY_CONFIG = {
+  enableRecovery: true,
+  recoveryTimeout: 90000,       // 90秒后尝试恢复
+  maxRecoveryAttempts: 2,       // 最大恢复尝试次数
+  degradeThreshold: 0.5         // 超过50% Agent失效才降级
+};
+
+async function recoverRound(blackboard, failedAgents) {
+  const totalAgents = Object.keys(blackboard.metadata.agentStates).length;
+  const failedRatio = failedAgents.length / totalAgents;
+
+  // 如果超过阈值，降级处理
+  if (failedRatio > ROUND_RECOVERY_CONFIG.degradeThreshold) {
+    return {
+      action: "degrade",
+      message: `${failedAgents.length}/${totalAgents} Agent失效，降级处理`
+    };
+  }
+
+  // 尝试恢复每个失败的Agent
+  const recoveredAgents = [];
+  for (let agentId of failedAgents) {
+    const result = await recoverInterruptedAgent(agentId);
+    if (result.recovered) {
+      recoveredAgents.push(agentId);
+    }
+  }
+
+  // 如果恢复足够多的Agent，继续当前轮次
+  if (recoveredAgents.length > 0) {
+    return {
+      action: "continue",
+      recoveredAgents: recoveredAgents,
+      message: `恢复了 ${recoveredAgents.length} 个Agent`
+    };
+  }
+
+  // 无法恢复，用已有发现继续
+  return {
+    action: "proceed_with_available",
+    message: "使用可用Agent继续"
+  };
+}
+```
+
+---
+
+### 14.5 更新后的执行流程
+
+```
+改进后的轮次流程:
+
+┌─────────────────────────────────────────────────────────────┐
+│ Round N                                                      │
+├─────────────────────────────────────────────────────────────┤
+│  1. 广播 round_start                                         │
+│                                                              │
+│  2. Agent执行探索                                            │
+│     ├── 搜索超时 → 降级使用训练知识                          │
+│     └── 完成探索 → 发送 round_complete                       │
+│                                                              │
+│  3. 【新增】空闲Agent碰撞                                    │
+│     ├── 选择碰撞模式                                         │
+│     ├── 发送 collision_invitation                            │
+│     └── 处理 collision_response                               │
+│                                                              │
+│  4. 【新增】状态监控与恢复                                   │
+│     ├── 检测 interrupted 状态                                │
+│     ├── 发送 recovery_request                                │
+│     └── 等待恢复或降级                                       │
+│                                                              │
+│  5. 处理黑板操作                                             │
+│                                                              │
+│  6. 轮次结算                                                 │
+│                                                              │
+│  7. 检查收敛（minRounds后才可收敛）                          │
+└─────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### 14.6 更新后的检查清单
+
+每次运行Swarm时，Orchestrator必须完成以下步骤：
+
+#### 初始化阶段
+- [ ] TeamCreate 创建团队
+- [ ] TaskCreate 创建黑板（不设置owner）
+- [ ] 初始化 agentStates（包含内在阈值）
+- [ ] 启动所有Explorer Agent
+
+#### 每轮执行
+- [ ] 广播 round_start（包含agentState和黑板快照）
+- [ ] 等待Agent响应（使用同步屏障）
+- [ ] **【新增】检测空闲Agent，发送碰撞邀请**
+- [ ] **【新增】检测interrupted Agent，尝试恢复**
+- [ ] 处理所有 blackboard_operation 请求
+- [ ] 处理 collision_response（如有）
+- [ ] 使用 TaskUpdate 更新黑板 metadata
+- [ ] 返回 operation_result 给每个Agent
+- [ ] 执行轮次结算（信息素蒸发、清理信号）
+- [ ] 检查收敛（至少minRounds后才可收敛）
+
+#### 清理阶段
+- [ ] 发送 shutdown_request 给所有Agent
+- [ ] 等待 gracefulTimeout
+- [ ] 如果超时，执行强制清理
+- [ ] 删除团队目录
+
+---
+
+*Swarm v2.1.2 - 基于群体智能理论的自组织协作系统*
