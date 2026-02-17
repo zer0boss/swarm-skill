@@ -1,8 +1,19 @@
-# Swarm v2.1.2 - 多智能体蜂群协作系统
+# Swarm v2.2 - 多智能体蜂群协作系统
 
 > 基于群体智能理论，实现黑板代理、状态托管、多轮迭代、量化共识
 
-**版本: v2.1.2** | 发布日期: 2026-02-18
+**版本: v2.2.0** | 发布日期: 2026-02-18
+
+### v2.2 更新内容（理论符合性修复）
+
+| 问题 | 修复 | 优先级 |
+|------|------|--------|
+| Agent状态同步失效 | ✅ 新增状态同步协议，任务完成时强制更新 | P1 |
+| Shutdown流程不完整 | ✅ 新增三阶段关闭协议（预通知→优雅关闭→强制终止） | P1 |
+| 停止信号无效 | ✅ 信号立即降低目标信息素浓度，Agent必须响应 | P1 |
+| 随机探索未实现 | ✅ 强制15%随机探索，在round_start中明确指令 | P2 |
+| 角色转换未执行 | ✅ 轮次结算时强制检查并执行转换，立即通知Agent | P2 |
+| 多样性保护缺失 | ✅ 最少3轮收敛，90%共识率上限，强制保护机制 | P2 |
 
 ### v2.1.2 更新内容
 
@@ -170,19 +181,27 @@ Orchestrator代理执行所有写操作，并返回结果。
 
     // 全局配置
     config: {
-      evaporationRate: 0.05,
+      // v2.2 更新配置
+      evaporationRate: 0.08,      // 提高到8%（原5%），保持信息素梯度
       depositAmount: 0.1,
       maxAgentsPerTask: 3,
       betaStability: 2,
       quorumThreshold: 0.67,
       minDiversity: 0.4,
       maxRounds: 10,
-      minRounds: 2,           // v2.1.1: 最少轮数（验证β稳定性）
-      roundTimeout: 120000,   // 2分钟
-      responseTimeout: 60000, // 1分钟
-      syncBarrierTimeout: 60000,  // v2.1.1: 同步屏障超时
-      shutdownTimeout: 30000,     // v2.1.1: 优雅关闭超时
-      forceCleanup: true          // v2.1.1: 超时后强制清理
+      minRounds: 3,               // v2.2: 提高到3（原2），保证探索充分
+      minRoundsBeforeConvergence: 3,  // v2.2: 最少3轮才能收敛
+      maxConsensusRate: 0.9,      // v2.2: 单轮最大共识率90%
+      roundTimeout: 120000,       // 2分钟
+      responseTimeout: 60000,     // 1分钟
+      syncBarrierTimeout: 60000,  // 同步屏障超时
+
+      // v2.2 三阶段关闭配置
+      preNotifyTimeout: 5000,     // 预通知: 5秒
+      gracefulTimeout: 15000,     // 优雅关闭: 15秒
+      forceCleanupTimeout: 10000, // 强制终止: 10秒
+
+      forceCleanup: true          // 超时后强制清理
     }
   }
   // 不设置owner！保持共享
@@ -1034,6 +1053,46 @@ SendMessage({
 2. 15%概率：选择未覆盖方向
 3. 15%概率：完全随机探索（基于你的 randomExploreProb）
 
+## v2.2 轮次指令（必须遵守）
+
+收到 `round_start` 消息后，检查 `instructions` 字段：
+
+### 情况1: forceRandomExplore = true
+你**必须**忽略信息素，随机选择一个探索方向。
+这是为了保证系统多样性，防止过早收敛。**这是强制性指令！**
+
+### 情况2: mustSwitchDirection = true
+你当前的方向被停止信号抑制，**必须**切换到其他方向。
+- 你的阈值 = {internalThreshold}
+- 有效浓度 = {effectiveConc}
+- 当 effectiveConc < internalThreshold 时，必须切换
+
+### 情况3: currentDirectionInhibited = true
+你当前方向收到了停止信号，但还可以继续。
+- 建议考虑其他方向
+- 如果继续，需要提供更强的理由
+
+### 情况4: 正常模式
+按照信息素浓度选择方向。
+
+## 停止信号处理（v2.2 强化）
+
+当你发现矛盾证据时，发送停止信号：
+```
+SendMessage({
+  type: "blackboard_operation",
+  operation: "send_stop_signal",
+  params: {
+    targetDirection: "目标方向",
+    reason: "contradictory_evidence",
+    evidence: "证据描述"
+  }
+})
+```
+
+**重要**: 停止信号会立即降低目标方向的信息素浓度30%。
+被抑制的Agent必须根据其阈值决定是否切换方向。
+
 ## 轮次响应格式
 
 收到 `round_start` 后，完成探索并发送：
@@ -1053,13 +1112,36 @@ SendMessage({
 })
 ```
 
-## 角色演化（自动触发）
+## 角色演化（v2.2 强制执行）
 
-- 信息素>0.7 + 沉积>3次 → 可能转为 DeepAnalyst
-- 发现冲突 → 转为 Debater
-- 完成2轮探索 → 可能转为 Synthesizer
+**重要变更**: 角色转换不再是"可能"，而是满足条件后**强制执行**。
+你会在轮次结算时收到 `role_transition_executed` 消息。
 
-收到 `role_transition` 消息后，你的角色和能力会改变。
+### 转换条件（自动检测）
+- 信息素>0.7 + 沉积>3次 → **转为** DeepAnalyst
+- 发现冲突（发送停止信号）→ **转为** Debater
+- 完成2轮探索 → **转为** Synthesizer
+
+### 收到转换消息后
+```
+{
+  "type": "role_transition_executed",
+  "fromRole": "EXPLORER",
+  "toRole": "DEEP_ANALYST",
+  "capabilities": { ... },
+  "instructions": "你的新角色指令..."
+}
+```
+
+**必须**按照新角色的指令行动！
+
+### 各角色职责
+
+**DeepAnalyst**: 深入分析最高信息素浓度的方向，寻找深层逻辑和数据支持
+
+**Debater**: 审查主流观点，寻找逻辑漏洞，发送停止信号挑战不充分的方向
+
+**Synthesizer**: 整合所有发现，识别共性和分歧，生成阶段性综合报告
 
 ## 任务
 {任务描述}
@@ -1258,7 +1340,323 @@ if (convergenceResult.converged) {
 
 ---
 
-## 九、自我约束规则
+## 九、v2.2 核心协议（理论符合性修复）
+
+### 9.0 v2.2 新增协议概述
+
+| 协议 | 解决问题 | 核心机制 |
+|------|----------|----------|
+| 状态同步协议 | 任务状态与实际不同步 | 收敛时强制更新黑板和Agent状态 |
+| 三阶段关闭协议 | Agent无法正确终止 | 预通知→优雅关闭→强制终止 |
+| 停止信号强化 | 信号无效 | 立即降低目标信息素，Agent必须响应 |
+| 随机探索强制 | 无随机探索 | round_start明确指令强制随机 |
+| 角色转换执行 | 角色不演化 | 轮次结算强制检查并通知 |
+| 多样性保护 | 过早收敛 | 最少3轮、90%上限、强制保护动作 |
+
+### 9.0.1 状态同步协议
+
+```javascript
+// 任务完成时必须执行
+const STATE_SYNC_PROTOCOL = {
+  onComplete: async (blackboard, convergenceResult) => {
+    // 1. 标记黑板任务完成
+    await TaskUpdate({
+      taskId: blackboardTaskId,
+      status: "completed",
+      metadata: {
+        ...blackboard.metadata,
+        convergenceResult: convergenceResult,
+        completedAt: Date.now()
+      }
+    });
+
+    // 2. 更新所有Agent状态
+    for (let agentId in blackboard.metadata.agentStates) {
+      blackboard.metadata.agentStates[agentId].status = "completed";
+    }
+
+    // 3. 记录完成事件
+    blackboard.metadata.events = blackboard.metadata.events || [];
+    blackboard.metadata.events.push({
+      type: "swarm_completed",
+      round: currentRound,
+      convergenceResult: convergenceResult,
+      timestamp: Date.now()
+    });
+
+    return { synced: true };
+  }
+};
+```
+
+### 9.0.2 三阶段关闭协议
+
+```javascript
+const SHUTDOWN_PROTOCOL = {
+  phases: {
+    // 阶段1: 预通知（5秒）
+    preNotify: { timeout: 5000, action: "broadcast_shutdown_imminent" },
+
+    // 阶段2: 正式请求（15秒）
+    gracefulRequest: { timeout: 15000, action: "send_shutdown_request" },
+
+    // 阶段3: 强制终止（10秒后）
+    forceTerminate: { timeout: 10000, action: "force_cleanup" }
+  },
+
+  execute: async (agents, blackboard) => {
+    const results = { graceful: [], forced: [], failed: [] };
+
+    // 阶段1: 预通知
+    await broadcast({ type: "shutdown_imminent", prepareTime: 5000 });
+    await sleep(5000);
+
+    // 阶段2: 正式请求
+    for (let agent of agents) {
+      const result = await sendShutdownRequest(agent.id, 15000);
+      if (result.acknowledged) {
+        results.graceful.push(agent.id);
+      } else {
+        results.failed.push(agent.id);
+      }
+    }
+
+    // 阶段3: 强制清理
+    const remaining = agents.filter(a => !results.graceful.includes(a.id));
+    if (remaining.length > 0) {
+      for (let agent of remaining) {
+        blackboard.metadata.agentStates[agent.id].status = "terminated";
+        blackboard.metadata.agentStates[agent.id].terminationReason = "forced";
+        results.forced.push(agent.id);
+      }
+    }
+
+    return { success: true, ...results };
+  }
+};
+```
+
+### 9.0.3 停止信号强化（必须执行）
+
+```javascript
+// 发送停止信号时，立即降低目标信息素
+const ENHANCED_STOP_SIGNAL = {
+  handler: (blackboard, params, agentId) => {
+    const signal = {
+      id: `signal-${Date.now()}`,
+      from: agentId,
+      target: params.targetDirection,
+      reason: params.reason,
+      evidence: params.evidence,
+      strength: 0.3,
+      timestamp: Date.now(),
+      active: true
+    };
+
+    blackboard.metadata.stopSignals.push(signal);
+
+    // 【关键】立即降低目标信息素浓度
+    const targetPh = blackboard.metadata.pheromones[params.targetDirection];
+    if (targetPh) {
+      targetPh.concentration *= (1 - signal.strength);
+      targetPh.suppressedBy = targetPh.suppressedBy || [];
+      targetPh.suppressedBy.push(signal.id);
+    }
+
+    blackboard.metadata.agentStates[agentId].stats.signalsSent++;
+
+    return {
+      success: true,
+      signalId: signal.id,
+      suppressedConcentration: targetPh?.concentration
+    };
+  },
+
+  // Agent选择方向时检查抑制
+  checkInhibition: (blackboard, agentId, direction) => {
+    const signals = blackboard.metadata.stopSignals.filter(
+      s => s.target === direction && s.active
+    );
+
+    if (signals.length === 0) return { inhibited: false };
+
+    const totalStrength = Math.min(
+      signals.reduce((sum, s) => sum + s.strength, 0),
+      0.5
+    );
+
+    const rawConc = blackboard.metadata.pheromones[direction]?.concentration || 0;
+    const effectiveConc = rawConc * (1 - totalStrength);
+
+    const state = blackboard.metadata.agentStates[agentId];
+    const responseProb = (effectiveConc ** 2) / (effectiveConc ** 2 + state.internalThreshold ** 2);
+
+    return {
+      inhibited: Math.random() > responseProb,
+      shouldSwitch: effectiveConc < state.internalThreshold,
+      totalStrength, rawConc, effectiveConc
+    };
+  }
+};
+```
+
+### 9.0.4 随机探索强制执行
+
+```javascript
+// 在 broadcastRoundStart 中强制执行
+async function broadcastRoundStart(round, blackboard) {
+  for (let agentId in blackboard.metadata.agentStates) {
+    const state = blackboard.metadata.agentStates[agentId];
+    if (state.status !== "active") continue;
+
+    // 【关键】计算是否强制随机探索
+    const forceRandomExplore = Math.random() < state.randomExploreProb;
+
+    // 检查抑制状态
+    const currentDir = state.current.exploringDirection;
+    const inhibition = currentDir
+      ? ENHANCED_STOP_SIGNAL.checkInhibition(blackboard, agentId, currentDir)
+      : { inhibited: false };
+
+    await SendMessage({
+      type: "message",
+      recipient: agentId,
+      content: JSON.stringify({
+        type: "round_start",
+        round: round,
+        agentState: state,
+        blackboardSnapshot: { /* ... */ },
+        // 【新增】强制指令
+        instructions: {
+          forceRandomExplore: forceRandomExplore,
+          mustSwitchDirection: inhibition.shouldSwitch,
+          currentDirectionInhibited: inhibition.inhibited
+        }
+      }),
+      summary: `Round ${round} 开始 ${forceRandomExplore ? '(强制随机探索)' : ''}`
+    });
+  }
+}
+```
+
+### 9.0.5 角色转换强制执行
+
+```javascript
+// 在 settleRound 中强制执行
+async function settleRound(blackboard) {
+  const transitions = checkRoleTransitions(blackboard);
+
+  for (let transition of transitions) {
+    const state = blackboard.metadata.agentStates[transition.agentId];
+
+    // 执行转换
+    const oldRole = state.role;
+    state.role = transition.toRole;
+    state.roleHistory = state.roleHistory || [];
+    state.roleHistory.push({
+      from: oldRole, to: transition.toRole,
+      reason: transition.reason, timestamp: Date.now()
+    });
+
+    // 【关键】立即通知Agent
+    await SendMessage({
+      type: "message",
+      recipient: transition.agentId,
+      content: JSON.stringify({
+        type: "role_transition_executed",
+        fromRole: oldRole,
+        toRole: transition.toRole,
+        reason: transition.reason,
+        capabilities: ROLE_CAPABILITIES[transition.toRole],
+        instructions: getRoleInstructions(transition.toRole)
+      }),
+      summary: `角色转换: ${oldRole} → ${transition.toRole}`
+    });
+  }
+}
+
+const ROLE_CAPABILITIES = {
+  DEEP_ANALYST: {
+    description: "深入分析高价值方向",
+    canDo: ["deep_dive", "strengthen_pheromone"],
+    focusOn: "最高信息素浓度的方向"
+  },
+  DEBATER: {
+    description: "挑战主流观点",
+    canDo: ["send_stop_signal", "propose_alternative"],
+    focusOn: "寻找主流观点的漏洞"
+  },
+  SYNTHESIZER: {
+    description: "整合多个观点",
+    canDo: ["merge_findings", "generate_summary"],
+    focusOn: "综合所有发现"
+  }
+};
+```
+
+### 9.0.6 多样性保护机制
+
+```javascript
+const DIVERSITY_PROTECTION = {
+  minRoundsBeforeConvergence: 3,
+  minDiversityThreshold: 0.4,
+  maxConsensusRate: 0.9,
+
+  canConverge: (blackboard, currentRound) => {
+    // 1. 最少轮数检查
+    if (currentRound < 3) {
+      return { allowed: false, reason: `min_rounds: ${currentRound}/3` };
+    }
+
+    // 2. 多样性检查
+    const diversity = calculateDiversity(blackboard);
+    if (diversity.overall < 0.4) {
+      return { allowed: false, reason: `diversity: ${diversity.overall.toFixed(2)}/0.4` };
+    }
+
+    // 3. 共识率检查
+    const consensusRate = calculateConsensusRate(blackboard);
+    if (consensusRate > 0.9 && currentRound < 5) {
+      return { allowed: false, reason: `consensus_too_fast: ${consensusRate}` };
+    }
+
+    return { allowed: true, diversity, consensusRate };
+  },
+
+  protect: async (blackboard) => {
+    const actions = [];
+
+    // 1. 强制随机探索
+    for (let agentId in blackboard.metadata.agentStates) {
+      blackboard.metadata.agentStates[agentId].forceRandomExplore = true;
+    }
+    actions.push("all_agents_force_random");
+
+    // 2. 激活Debater
+    const explorers = Object.entries(blackboard.metadata.agentStates)
+      .filter(([_, s]) => s.role === "EXPLORER" && s.status === "active");
+    if (explorers.length > 0) {
+      explorers[0][1].role = "DEBATER";
+      actions.push(`activated_debater:${explorers[0][0]}`);
+    }
+
+    // 3. 降低主导信息素
+    const pheromones = blackboard.metadata.pheromones;
+    const maxDir = Object.entries(pheromones)
+      .sort((a, b) => b[1].concentration - a[1].concentration)[0];
+    if (maxDir && maxDir[1].concentration > 0.7) {
+      maxDir[1].concentration *= 0.7;
+      actions.push(`suppressed:${maxDir[0]}`);
+    }
+
+    return { actions };
+  }
+};
+```
+
+---
+
+## 十、自我约束规则
 
 ### 9.1 禁止行为
 
@@ -1360,6 +1758,18 @@ T3: Synthesizer × 3, DeepAnalyst × 2, Debater × 1
 | v2.1 | 2026-02-17 | 黑板代理、状态托管、多轮迭代、超时降级、角色触发器、StopSignal协议、独特Agent命名 |
 | v2.1.1 | 2026-02-18 | 强制清理机制、同步屏障、最少轮数限制、黑板操作执行清单、shutdown超时配置 |
 | v2.1.2 | 2026-02-18 | Web搜索降级、Agent状态恢复、空闲碰撞机制、轮次恢复机制 |
+| **v2.2** | 2026-02-18 | **理论符合性修复**：状态同步协议、三阶段关闭、停止信号强化、强制随机探索、角色转换执行、多样性保护 |
+
+### v2.2 重点改进
+
+| 问题 | 修复 |
+|------|------|
+| Agent状态不同步 | ✅ 收敛时强制更新黑板和Agent状态为completed |
+| Shutdown循环 | ✅ 三阶段关闭：预通知→优雅关闭→强制终止 |
+| 停止信号无效 | ✅ 信号立即降低目标信息素30%，Agent必须响应 |
+| 无随机探索 | ✅ round_start明确指令forceRandomExplore |
+| 角色不演化 | ✅ 轮次结算强制检查并执行转换，立即通知Agent |
+| 过早收敛 | ✅ 最少3轮收敛、90%共识率上限、强制保护动作 |
 
 ---
 
@@ -2101,34 +2511,44 @@ async function recoverRound(blackboard, failedAgents) {
 
 ---
 
-### 14.6 更新后的检查清单
+### 14.6 更新后的检查清单 (v2.2)
 
 每次运行Swarm时，Orchestrator必须完成以下步骤：
 
 #### 初始化阶段
 - [ ] TeamCreate 创建团队
 - [ ] TaskCreate 创建黑板（不设置owner）
-- [ ] 初始化 agentStates（包含内在阈值）
+- [ ] 初始化 agentStates（包含内在阈值和随机探索概率）
 - [ ] 启动所有Explorer Agent
 
 #### 每轮执行
-- [ ] 广播 round_start（包含agentState和黑板快照）
+- [ ] 广播 round_start（包含agentState、黑板快照和**v2.2强制指令**）
+- [ ] **【v2.2】计算forceRandomExplore并包含在instructions中**
+- [ ] **【v2.2】检查停止信号抑制，设置mustSwitchDirection**
 - [ ] 等待Agent响应（使用同步屏障）
-- [ ] **【新增】检测空闲Agent，发送碰撞邀请**
-- [ ] **【新增】检测interrupted Agent，尝试恢复**
+- [ ] 检测空闲Agent，发送碰撞邀请
+- [ ] 检测interrupted Agent，尝试恢复
 - [ ] 处理所有 blackboard_operation 请求
+- [ ] **【v2.2】停止信号立即降低目标信息素浓度**
 - [ ] 处理 collision_response（如有）
 - [ ] 使用 TaskUpdate 更新黑板 metadata
 - [ ] 返回 operation_result 给每个Agent
-- [ ] 执行轮次结算（信息素蒸发、清理信号）
-- [ ] 检查收敛（至少minRounds后才可收敛）
+- [ ] 执行轮次结算
+- [ ] **【v2.2】强制检查并执行角色转换，立即通知Agent**
+- [ ] **【v2.2】检查多样性保护，必要时触发保护动作**
+- [ ] 检查收敛（**至少3轮**后才可收敛，共识率≤90%）
 
-#### 清理阶段
-- [ ] 发送 shutdown_request 给所有Agent
-- [ ] 等待 gracefulTimeout
-- [ ] 如果超时，执行强制清理
+#### 收敛/完成阶段
+- [ ] **【v2.2】执行状态同步协议：标记黑板completed，更新所有Agent状态**
+- [ ] **【v2.2】记录完成事件到黑板metadata.events**
+- [ ] 生成最终报告
+
+#### 清理阶段（三阶段关闭）
+- [ ] **【v2.2】阶段1：预通知 shutdown_imminent（5秒）**
+- [ ] **【v2.2】阶段2：优雅关闭 shutdown_request（15秒）**
+- [ ] **【v2.2】阶段3：强制终止，标记Agent为terminated**
 - [ ] 删除团队目录
 
 ---
 
-*Swarm v2.1.2 - 基于群体智能理论的自组织协作系统*
+*Swarm v2.2 - 基于群体智能理论的自组织协作系统 | 理论符合性修复版本*
