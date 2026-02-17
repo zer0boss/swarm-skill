@@ -1,0 +1,104 @@
+# Swarm 配置模板
+# 复制此文件并根据需要调整参数
+
+# ========== 基本配置 ==========
+swarm:
+  name: "my-swarm"
+  mode: "bee"  # bee | ant | fish
+
+# ========== 角色配置 ==========
+roles:
+  explorer:
+    count: 2
+    model: "claude-opus-4-6"
+    tools:
+      allow: ["read", "grep", "glob", "SendMessage", "TaskCreate", "TaskUpdate"]
+      deny: ["edit", "write", "bash"]
+    behavior:
+      on_discovery: "leave_pheromone"
+      on_high_quality: "broadcast_dance"
+      exploration_rate: 0.1  # 10%随机探索
+
+  worker:
+    count: 2
+    model: "claude-sonnet-4-5"
+    tools:
+      profile: "full"
+    behavior:
+      on_complete: "notify_validator"
+      follow_pheromone: true
+
+  validator:
+    count: 1
+    model: "claude-opus-4-6"
+    tools:
+      allow: ["read", "grep", "SendMessage", "TaskUpdate", "TaskList"]
+    behavior:
+      on_approve: "vote_approve"
+      on_reject: "request_refinement"
+
+# ========== 通信配置 ==========
+communication:
+  pattern: "stigmergy"  # stigmergy | blackboard | hybrid
+
+  # 数字信息素
+  pheromone:
+    decay_rate: 0.1      # λ: 衰减系数
+    min_intensity: 0.3   # 最低感知阈值
+    ttl: 3600            # 生存时间(秒)
+
+  # 黑板架构
+  blackboard:
+    enabled: true
+    entry_ttl: 86400     # 条目生存时间(秒)
+    max_claim_attempts: 3
+
+  # 蜜蜂摇摆舞
+  waggle_dance:
+    enabled: true
+    high_quality_threshold: 0.7
+    medium_quality_threshold: 0.4
+
+# ========== 收敛配置 ==========
+convergence:
+  protocol: "aegean"
+
+  stability_horizon:
+    beta: 2              # 连续一致轮数
+
+  consensus:
+    algorithm: "weighted_quorum"
+    threshold: 0.67      # 法定人数比例
+    weights:
+      validator: 2.0
+      explorer: 0.5
+      worker: 1.0
+
+  termination:
+    max_rounds: 5        # 最大迭代轮数
+    max_time: 3600       # 最大时间(秒) 60分钟
+    max_tokens: 100000   # 最大Token
+
+  fallback:
+    on_timeout: "return_best"
+    on_exhausted: "escalate_to_human"
+    on_divergence: "force_vote"
+
+# ========== 噪声配置 ==========
+noise:
+  exploration_rate: 0.15   # 15%随机探索
+  dissent_tolerance: 0.2   # 20%异议容忍
+  error_degrees: 15        # 模拟蜜蜂的误差角度
+
+# ========== 安全边界 ==========
+security:
+  orchestrator_restrictions:
+    cannot_set_owner: true
+    cannot_edit_files: true
+    cannot_execute_commands: true
+
+  forbidden_patterns:
+    - "你去"
+    - "请处理"
+    - "分配给"
+    - "你必须"
