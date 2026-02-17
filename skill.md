@@ -1,8 +1,42 @@
-# Swarm v2.2 - 多智能体蜂群协作系统
+# Swarm v2.4 - 多智能体蜂群协作系统
 
 > 基于群体智能理论，实现黑板代理、状态托管、多轮迭代、量化共识
 
-**版本: v2.2.0** | 发布日期: 2026-02-18
+**版本: v2.4.0** | 发布日期: 2026-02-18
+
+### v2.4 更新内容（强制协议执行 + 研究成果归档）
+
+| 问题 | 修复 | 优先级 |
+|------|------|--------|
+| 黑板代理未执行 | ✅ Agent **必须**通过SendMessage发送操作，禁止在报告中声明 | P0 |
+| 阈值响应未体现 | ✅ 强制决策报告，**必须**包含P(S,θ)计算过程 | P0 |
+| 停止信号未激活 | ✅ 强制冲突审查，每轮**必须**提交审查报告 | P1 |
+| 强制终止需手动 | ✅ 自动强制终止机制，无需手动修改配置 | P1 |
+| 随机探索未执行 | ✅ 合规性检查器验证，违规标记处罚 | P1 |
+| 研究成果无归档 | ✅ 独立运行目录 + 研究报告自动生成 | P2 |
+| Agent违规无处理 | ✅ 违规积分机制，超阈值强制终止 | P1 |
+
+### v2.4 新增功能
+
+| 功能 | 说明 |
+|------|------|
+| **运行目录管理** | 每次运行创建独立目录 `swarm-runs/YYYY-MM-DD-task-slug/` |
+| **研究报告生成** | 自动生成 `final-research-report.md` 人类可读报告 |
+| **合规性检查器** | `AGENT_COMPLIANCE_CHECKER` 验证Agent行为是否符合协议 |
+| **违规处理器** | `VIOLATION_HANDLER` 累计违规分数，触发降级/终止 |
+| **自动强制终止** | `AUTO_FORCE_TERMINATE` 无需手动干预的强制终止机制 |
+
+### v2.3 更新内容（执行层修复 - 基于实际运行复盘）
+
+| 问题 | 修复 | 优先级 |
+|------|------|--------|
+| 黑板代理未执行 | ✅ 新增操作队列+确认机制，必须返回operation_result | P0 |
+| 信息素系统虚假 | ✅ 信息素只能通过Agent的deposit_pheromone修改 | P0 |
+| Shutdown第三阶段未执行 | ✅ 强制终止机制，必须标记Agent为terminated | P0 |
+| 阈值响应模型未应用 | ✅ 决策时强制计算responseProbability | P1 |
+| Agent沉默未处理 | ✅ 沉默检测+强制唤醒+降级机制 | P1 |
+| 收敛判断无计算 | ✅ CONVERGENCE_CALCULATOR输出具体数值 | P1 |
+| Orchestrator跳过步骤 | ✅ 执行状态机，每步必须显式确认 | P0 |
 
 ### v2.2 更新内容（理论符合性修复）
 
@@ -1340,20 +1374,722 @@ if (convergenceResult.converged) {
 
 ---
 
-## 九、v2.2 核心协议（理论符合性修复）
+## 九、v2.3 核心协议（执行层修复）
 
-### 9.0 v2.2 新增协议概述
+### 9.0 v2.3 新增协议概述
 
 | 协议 | 解决问题 | 核心机制 |
 |------|----------|----------|
-| 状态同步协议 | 任务状态与实际不同步 | 收敛时强制更新黑板和Agent状态 |
-| 三阶段关闭协议 | Agent无法正确终止 | 预通知→优雅关闭→强制终止 |
-| 停止信号强化 | 信号无效 | 立即降低目标信息素，Agent必须响应 |
-| 随机探索强制 | 无随机探索 | round_start明确指令强制随机 |
-| 角色转换执行 | 角色不演化 | 轮次结算强制检查并通知 |
-| 多样性保护 | 过早收敛 | 最少3轮、90%上限、强制保护动作 |
+| **执行状态机** | Orchestrator跳过步骤 | 每步必须markStepCompleted/assertStepCompleted |
+| **黑板操作队列** | 操作请求无确认 | pending→processed必须配对，返回operation_result |
+| **信息素真实化** | 浓度手动设置 | 只能通过deposit_pheromone修改 |
+| **强制终止机制** | Agent不关闭 | 第三阶段必须执行，标记terminated |
+| **沉默检测恢复** | Agent无输出 | 检测沉默→强制唤醒→降级 |
+| **收敛计算器** | 无实际计算 | 输出β稳定性、法定人数、多样性具体数值 |
 
-### 9.0.1 状态同步协议
+### 9.0.1 Orchestrator执行状态机（v2.3核心）
+
+```javascript
+// v2.3 新增: 执行状态机
+const ORCHESTRATOR_EXECUTION_STATE = {
+  currentPhase: "INIT",
+  completedSteps: new Set(),
+  requiredSteps: {
+    "INIT": ["create_team", "create_blackboard", "init_agent_states", "spawn_agents"],
+    "ROUND": ["broadcast_round_start", "wait_responses", "process_operations",
+              "return_results", "update_blackboard", "settle_round"],
+    "CONVERGENCE": ["check_beta_stability", "check_quorum", "check_diversity", "generate_report"],
+    "SHUTDOWN": ["pre_notify", "graceful_request", "force_terminate", "mark_all_terminated"]
+  }
+};
+
+// 强制检查函数
+function assertStepCompleted(phase, step) {
+  const key = `${phase}:${step}`;
+  if (!ORCHESTRATOR_EXECUTION_STATE.completedSteps.has(key)) {
+    const error = `CRITICAL: Step ${key} not completed!`;
+    console.error(`[STATE MACHINE] ${error}`);
+    throw new Error(error);
+  }
+}
+
+// 标记完成
+function markStepCompleted(phase, step) {
+  const key = `${phase}:${step}`;
+  ORCHESTRATOR_EXECUTION_STATE.completedSteps.add(key);
+  console.log(`[STATE MACHINE] ✓ ${key}`);
+}
+
+// 阶段完成验证
+function assertPhaseCompleted(phase) {
+  const required = ORCHESTRATOR_EXECUTION_STATE.requiredSteps[phase] || [];
+  for (let step of required) {
+    assertStepCompleted(phase, step);
+  }
+  console.log(`[STATE MACHINE] ✓✓ Phase ${phase} completed`);
+}
+```
+
+### 9.0.2 黑板操作队列与确认机制（v2.3核心）
+
+```javascript
+// v2.3 新增: 黑板操作队列
+const BLACKBOARD_OPERATION_QUEUE = {
+  pending: [],
+  processed: [],
+  failed: []
+};
+
+// 新增: 操作处理函数（必须执行并返回结果）
+async function processBlackboardOperation(message, blackboard, blackboardTaskId) {
+  const { operation, params } = message;
+  const agentId = message.from;
+
+  // 1. 记录操作请求
+  const opRecord = {
+    id: `op-${Date.now()}`,
+    operation,
+    params,
+    from: agentId,
+    status: "pending",
+    timestamp: Date.now()
+  };
+  BLACKBOARD_OPERATION_QUEUE.pending.push(opRecord);
+  console.log(`[BLACKBOARD] Received: ${operation} from ${agentId}`);
+
+  // 2. 执行操作
+  const opDef = BLACKBOARD_OPERATIONS[operation];
+  if (!opDef) {
+    opRecord.status = "failed";
+    opRecord.error = "unknown_operation";
+    BLACKBOARD_OPERATION_QUEUE.failed.push(opRecord);
+
+    // 必须返回失败结果
+    await SendMessage({
+      type: "message",
+      recipient: agentId,
+      content: JSON.stringify({
+        type: "operation_result",
+        operationId: opRecord.id,
+        success: false,
+        error: "unknown_operation"
+      }),
+      summary: `操作失败: 未知操作 ${operation}`
+    });
+    return { success: false, error: "unknown_operation" };
+  }
+
+  // 3. 执行handler
+  const result = opDef.handler(blackboard, params, agentId);
+  opRecord.status = "completed";
+  opRecord.result = result;
+  BLACKBOARD_OPERATION_QUEUE.processed.push(opRecord);
+
+  // 4. 【关键】必须返回operation_result给Agent
+  await SendMessage({
+    type: "message",
+    recipient: agentId,
+    content: JSON.stringify({
+      type: "operation_result",
+      operationId: opRecord.id,
+      ...result
+    }),
+    summary: `黑板操作结果: ${operation} - ${result.success ? '成功' : '失败'}`
+  });
+  console.log(`[BLACKBOARD] Result sent to ${agentId}: ${result.success}`);
+
+  // 5. 更新黑板Task
+  await TaskUpdate({
+    taskId: blackboardTaskId,
+    metadata: {
+      pheromones: blackboard.metadata.pheromones,
+      findings: blackboard.metadata.findings,
+      stopSignals: blackboard.metadata.stopSignals,
+      agentStates: blackboard.metadata.agentStates,
+      operationLog: BLACKBOARD_OPERATION_QUEUE.processed
+    }
+  });
+
+  return result;
+}
+
+// 验证操作队列
+function validateOperationQueue() {
+  const pending = BLACKBOARD_OPERATION_QUEUE.pending.length;
+  const processed = BLACKBOARD_OPERATION_QUEUE.processed.length;
+  const failed = BLACKBOARD_OPERATION_QUEUE.failed.length;
+
+  if (pending !== processed + failed) {
+    console.error(`[VALIDATION] Operation queue mismatch: ${pending} pending, ${processed} processed, ${failed} failed`);
+    return false;
+  }
+  console.log(`[VALIDATION] ✓ Operation queue: ${processed}/${pending} processed`);
+  return true;
+}
+```
+
+### 9.0.3 信息素真实化（v2.3核心）
+
+```javascript
+// v2.3: 信息素只能通过Agent的deposit_pheromone修改
+// 禁止直接设置浓度！
+
+// 信息素操作（唯一入口）
+const BLACKBOARD_OPERATIONS = {
+  DEPOSIT_PHEROMONE: {
+    name: "deposit_pheromone",
+    params: {
+      direction: "string",
+      amount: "number"  // 可选，默认0.1
+    },
+    handler: (blackboard, params, agentId) => {
+      const ph = blackboard.metadata.pheromones;
+      const direction = params.direction;
+      const amount = params.amount || 0.1;
+
+      // 【关键】这是唯一修改信息素浓度的方式
+      if (!ph[direction]) {
+        ph[direction] = {
+          concentration: 0,
+          depositedBy: [],
+          createdAt: Date.now()
+        };
+      }
+
+      // 沉积（累加）
+      ph[direction].concentration = Math.min(
+        ph[direction].concentration + amount,
+        1.0
+      );
+      ph[direction].lastUpdate = Date.now();
+      ph[direction].lastDepositor = agentId;
+
+      if (!ph[direction].depositedBy.includes(agentId)) {
+        ph[direction].depositedBy.push(agentId);
+      }
+
+      // 记录沉积历史
+      ph[direction].depositHistory = ph[direction].depositHistory || [];
+      ph[direction].depositHistory.push({
+        agentId,
+        amount,
+        timestamp: Date.now()
+      });
+
+      // 更新Agent统计
+      blackboard.metadata.agentStates[agentId].stats.pheromoneDeposits++;
+
+      return {
+        success: true,
+        direction: direction,
+        newConcentration: ph[direction].concentration,
+        depositedBy: agentId
+      };
+    }
+  }
+  // ... 其他操作保持不变
+};
+
+// 信息素蒸发（轮次结算时自动执行）
+function evaporatePheromones(blackboard, rate = 0.08) {
+  const ph = blackboard.metadata.pheromones;
+
+  for (let direction in ph) {
+    const oldConc = ph[direction].concentration;
+    ph[direction].concentration = Math.max(
+      oldConc * (1 - rate),
+      0.1  // 最低阈值
+    );
+
+    // 记录蒸发事件
+    ph[direction].evaporationHistory = ph[direction].evaporationHistory || [];
+    ph[direction].evaporationHistory.push({
+      round: blackboard.metadata.currentRound,
+      before: oldConc,
+      after: ph[direction].concentration,
+      timestamp: Date.now()
+    });
+  }
+}
+
+// ⚠️ 禁止行为
+// ❌ blackboard.metadata.pheromones["方向A"].concentration = 0.8;
+// ✅ 必须通过Agent的deposit_pheromone操作
+```
+
+### 9.0.4 Shutdown强制终止机制（v2.3核心）
+
+```javascript
+// v2.3: 第三阶段必须执行
+const FORCE_TERMINATE_PROTOCOL = {
+  // 阶段3: 强制终止
+  execute: async (agentId, blackboard, teamName) => {
+    console.warn(`[FORCE TERMINATE] Agent ${agentId} 强制终止`);
+
+    // 1. 标记Agent状态
+    if (blackboard.metadata.agentStates[agentId]) {
+      blackboard.metadata.agentStates[agentId].status = "terminated";
+      blackboard.metadata.agentStates[agentId].terminatedAt = Date.now();
+      blackboard.metadata.agentStates[agentId].terminationReason = "forced";
+      blackboard.metadata.agentStates[agentId].terminationRound = blackboard.metadata.currentRound;
+    }
+
+    // 2. 记录终止事件
+    blackboard.metadata.events = blackboard.metadata.events || [];
+    blackboard.metadata.events.push({
+      type: "agent_force_terminated",
+      agentId: agentId,
+      round: blackboard.metadata.currentRound,
+      timestamp: Date.now()
+    });
+
+    return { terminated: true, agentId };
+  }
+};
+
+// 完整三阶段关闭
+async function executeShutdown(agents, blackboard, blackboardTaskId, teamName) {
+  const results = { graceful: [], forced: [], failed: [] };
+
+  // 阶段1: 预通知（5秒）
+  console.log("[SHUTDOWN] Phase 1: Pre-notify");
+  markStepCompleted("SHUTDOWN", "pre_notify_started");
+  for (let agent of agents) {
+    await SendMessage({
+      type: "message",
+      recipient: agent.id,
+      content: JSON.stringify({
+        type: "shutdown_imminent",
+        reason: "协作完成",
+        prepareTime: 5000
+      }),
+      summary: "预通知: 协作即将结束"
+    });
+  }
+  await sleep(5000);
+  markStepCompleted("SHUTDOWN", "pre_notify");
+
+  // 阶段2: 优雅关闭请求（15秒）
+  console.log("[SHUTDOWN] Phase 2: Graceful request");
+  markStepCompleted("SHUTDOWN", "graceful_request_started");
+  for (let agent of agents) {
+    try {
+      await SendMessage({
+        type: "shutdown_request",
+        recipient: agent.id,
+        content: "请关闭"
+      });
+
+      // 等待响应（最多15秒）
+      const response = await waitForShutdownResponse(agent.id, 15000);
+      if (response && response.acknowledged) {
+        results.graceful.push(agent.id);
+        blackboard.metadata.agentStates[agent.id].status = "terminated";
+        blackboard.metadata.agentStates[agent.id].terminationReason = "graceful";
+        console.log(`[SHUTDOWN] ✓ ${agent.id} 优雅关闭`);
+      }
+    } catch (e) {
+      console.log(`[SHUTDOWN] ✗ ${agent.id} 无响应: ${e.message}`);
+    }
+  }
+  markStepCompleted("SHUTDOWN", "graceful_request");
+
+  // 阶段3: 强制终止（必须执行！）
+  console.log("[SHUTDOWN] Phase 3: Force terminate");
+  const remainingAgents = agents.filter(a =>
+    !results.graceful.includes(a.id) &&
+    blackboard.metadata.agentStates[a.id]?.status !== "terminated"
+  );
+
+  if (remainingAgents.length > 0) {
+    console.warn(`[SHUTDOWN] ⚠️ ${remainingAgents.length} 个Agent需要强制终止`);
+
+    for (let agent of remainingAgents) {
+      await FORCE_TERMINATE_PROTOCOL.execute(agent.id, blackboard, teamName);
+      results.forced.push(agent.id);
+      console.log(`[SHUTDOWN] ⚡ ${agent.id} 强制终止`);
+    }
+  }
+  markStepCompleted("SHUTDOWN", "force_terminate");
+
+  // 验证所有Agent已终止
+  const allTerminated = Object.values(blackboard.metadata.agentStates)
+    .every(s => s.status === "terminated");
+  if (!allTerminated) {
+    console.error("[SHUTDOWN] ❌ 仍有Agent未终止!");
+  }
+  markStepCompleted("SHUTDOWN", "mark_all_terminated");
+
+  // 更新黑板
+  await TaskUpdate({
+    taskId: blackboardTaskId,
+    metadata: {
+      ...blackboard.metadata,
+      shutdownResult: results
+    }
+  });
+
+  console.log(`[SHUTDOWN] 完成: ${results.graceful.length} 优雅, ${results.forced.length} 强制`);
+  return results;
+}
+```
+
+### 9.0.5 Agent沉默检测与恢复（v2.3新增）
+
+```javascript
+// v2.3 新增: Agent沉默检测
+const AGENT_SILENCE_DETECTION = {
+  maxSilenceTime: 60000,     // 60秒无响应视为沉默
+  maxSilenceRounds: 2,       // 连续2轮沉默触发恢复
+
+  // 检测沉默
+  detectSilence: (blackboard, agentId) => {
+    const state = blackboard.metadata.agentStates[agentId];
+    if (!state) return { silent: false };
+
+    const lastActive = state.lastActiveAt || 0;
+    const silenceTime = Date.now() - lastActive;
+    const silenceRounds = state.stats?.silenceRounds || 0;
+
+    return {
+      silent: silenceTime > AGENT_SILENCE_DETECTION.maxSilenceTime,
+      silenceTime,
+      silenceRounds,
+      needsRecovery: silenceRounds >= AGENT_SILENCE_DETECTION.maxSilenceRounds
+    };
+  },
+
+  // 恢复沉默Agent
+  recover: async (blackboard, agentId, currentRound) => {
+    const state = blackboard.metadata.agentStates[agentId];
+
+    console.log(`[AGENT RECOVERY] 尝试恢复 ${agentId}`);
+
+    // 发送强制唤醒消息
+    await SendMessage({
+      type: "message",
+      recipient: agentId,
+      content: JSON.stringify({
+        type: "force_wake",
+        round: currentRound,
+        message: "你已沉默多轮，请立即响应。选择任意方向开始探索。",
+        blackboardSnapshot: {
+          pheromones: blackboard.metadata.pheromones,
+          findings: blackboard.metadata.findings
+        },
+        instructions: {
+          forceRandomExplore: true,
+          mustRespond: true
+        }
+      }),
+      summary: `强制唤醒: ${agentId}`
+    });
+
+    // 更新状态
+    state.lastActiveAt = Date.now();
+    state.stats.recoveryAttempts = (state.stats.recoveryAttempts || 0) + 1;
+
+    return { recovered: true, agentId };
+  },
+
+  // 降级无法恢复的Agent
+  degrade: async (blackboard, agentId) => {
+    const state = blackboard.metadata.agentStates[agentId];
+    state.status = "degraded";
+    state.degradedAt = Date.now();
+    state.degradedReason = "prolonged_silence";
+
+    console.warn(`[AGENT DEGRADE] ${agentId} 因长期沉默被降级`);
+
+    return { degraded: true, agentId };
+  }
+};
+
+// 在每轮检查
+async function checkAndRecoverSilentAgents(blackboard, currentRound) {
+  for (let agentId in blackboard.metadata.agentStates) {
+    const state = blackboard.metadata.agentStates[agentId];
+    if (state.status !== "active") continue;
+
+    const silence = AGENT_SILENCE_DETECTION.detectSilence(blackboard, agentId);
+
+    if (silence.needsRecovery) {
+      if (state.stats.recoveryAttempts >= 3) {
+        await AGENT_SILENCE_DETECTION.degrade(blackboard, agentId);
+      } else {
+        await AGENT_SILENCE_DETECTION.recover(blackboard, agentId, currentRound);
+      }
+    }
+  }
+}
+```
+
+### 9.0.6 收敛计算器（v2.3新增）
+
+```javascript
+// v2.3 新增: 收敛计算器 - 必须输出具体数值
+const CONVERGENCE_CALCULATOR = {
+  // β稳定性检查
+  checkBetaStability: (blackboard, beta = 2) => {
+    const history = blackboard.metadata.opinionHistory || [];
+
+    if (history.length < beta) {
+      return {
+        stable: false,
+        reason: `历史不足: ${history.length}/${beta}`,
+        rounds: history.length
+      };
+    }
+
+    // 提取最近β轮的核心观点集合
+    const recentHistory = history.slice(-beta);
+    const opinionSets = recentHistory.map(h =>
+      new Set(h.findings.map(f => f.coreIdea).filter(Boolean))
+    );
+
+    // 检查集合是否相同
+    const firstSet = opinionSets[0];
+    const isStable = opinionSets.every(set => setsEqual(set, firstSet));
+
+    return {
+      stable: isStable,
+      rounds: beta,
+      opinionSets: opinionSets.map(s => Array.from(s)),
+      consensus: Array.from(firstSet)
+    };
+  },
+
+  // 法定人数检查
+  checkQuorum: (blackboard, threshold = 0.67) => {
+    const findings = blackboard.metadata.findings || [];
+    const activeAgents = Object.values(blackboard.metadata.agentStates)
+      .filter(s => s.status === "active").length;
+
+    if (activeAgents === 0) {
+      return { quorum: false, reason: "无活跃Agent" };
+    }
+
+    // 统计每个观点的支持人数
+    const ideaSupport = {};
+    findings.forEach(f => {
+      if (f.coreIdea) {
+        ideaSupport[f.coreIdea] = ideaSupport[f.coreIdea] || new Set();
+        ideaSupport[f.coreIdea].add(f.agentId);
+      }
+    });
+
+    // 找出达到法定人数的观点
+    const quorumIdeas = [];
+    for (let [idea, supporters] of Object.entries(ideaSupport)) {
+      const rate = supporters.size / activeAgents;
+      if (rate >= threshold) {
+        quorumIdeas.push({
+          idea,
+          supporters: Array.from(supporters),
+          supportRate: rate
+        });
+      }
+    }
+
+    return {
+      quorum: quorumIdeas.length > 0,
+      threshold,
+      activeAgents,
+      quorumIdeas,
+      allIdeas: Object.keys(ideaSupport)
+    };
+  },
+
+  // 多样性检查
+  checkDiversity: (blackboard, minThreshold = 0.4) => {
+    const findings = blackboard.metadata.findings || [];
+    const pheromones = blackboard.metadata.pheromones || {};
+
+    // 1. 视角多样性
+    const perspectives = new Set(findings.map(f => f.perspective).filter(Boolean));
+    const perspectiveDiversity = Math.min(perspectives.size / 6, 1);
+
+    // 2. 观点正交性
+    const ideas = findings.map(f => f.coreIdea).filter(Boolean);
+    const uniqueIdeas = new Set(ideas);
+    const orthogonality = uniqueIdeas.size / Math.max(ideas.length, 1);
+
+    // 3. 信息素分布熵
+    const concentrations = Object.values(pheromones).map(p => p.concentration || 0);
+    const totalConc = concentrations.reduce((a, b) => a + b, 0);
+    const entropy = totalConc > 0
+      ? -concentrations.reduce((sum, c) => {
+          const p = c / totalConc;
+          return sum + (p > 0 ? p * Math.log2(p) : 0);
+        }, 0) / Math.log2(Math.max(concentrations.length, 2))
+      : 0;
+
+    const overall = (perspectiveDiversity + orthogonality + entropy) / 3;
+
+    return {
+      perspectiveDiversity,
+      orthogonality,
+      entropy,
+      overall,
+      aboveThreshold: overall >= minThreshold,
+      details: {
+        perspectiveCount: perspectives.size,
+        uniqueIdeaCount: uniqueIdeas.size,
+        totalIdeaCount: ideas.length,
+        directionCount: concentrations.length
+      }
+    };
+  },
+
+  // 综合收敛判断
+  evaluate: (blackboard, currentRound, config = {}) => {
+    const {
+      minRounds = 3,
+      betaStability = 2,
+      quorumThreshold = 0.67,
+      minDiversity = 0.4
+    } = config;
+
+    const result = {
+      round: currentRound,
+      minRoundsMet: currentRound >= minRounds,
+      betaStability: null,
+      quorum: null,
+      diversity: null,
+      converged: false,
+      reason: "",
+      calculationDetails: {}  // 必须包含计算细节
+    };
+
+    // 1. 最少轮数
+    if (!result.minRoundsMet) {
+      result.reason = `轮数不足: ${currentRound}/${minRounds}`;
+      return result;
+    }
+
+    // 2. β稳定性
+    result.betaStability = CONVERGENCE_CALCULATOR.checkBetaStability(blackboard, betaStability);
+    result.calculationDetails.betaStability = result.betaStability;
+    if (!result.betaStability.stable) {
+      result.reason = `观点不稳定: ${result.betaStability.reason}`;
+      return result;
+    }
+
+    // 3. 法定人数
+    result.quorum = CONVERGENCE_CALCULATOR.checkQuorum(blackboard, quorumThreshold);
+    result.calculationDetails.quorum = result.quorum;
+    if (!result.quorum.quorum) {
+      result.reason = `无法定人数共识`;
+      return result;
+    }
+
+    // 4. 多样性
+    result.diversity = CONVERGENCE_CALCULATOR.checkDiversity(blackboard, minDiversity);
+    result.calculationDetails.diversity = result.diversity;
+    if (!result.diversity.aboveThreshold) {
+      result.reason = `多样性不足: ${result.diversity.overall.toFixed(2)}/${minDiversity}`;
+      return result;
+    }
+
+    // 全部通过
+    result.converged = true;
+    result.reason = "所有收敛条件满足";
+
+    return result;
+  }
+};
+```
+
+### 9.0.7 阈值响应模型强制应用（v2.3强化）
+
+```javascript
+// 阈值响应函数（理论核心）
+function responseProbability(stimulus, threshold) {
+  if (stimulus === 0) return 0;
+  // P(S,θ) = S² / (S² + θ²)
+  return (stimulus ** 2) / (stimulus ** 2 + threshold ** 2);
+}
+
+// v2.3: Agent决策辅助函数（强制计算）
+function calculateAgentDecision(blackboard, agentId, candidateDirections) {
+  const state = blackboard.metadata.agentStates[agentId];
+  const threshold = state.internalThreshold;
+
+  const decisions = candidateDirections.map(dir => {
+    const rawConc = blackboard.metadata.pheromones[dir]?.concentration || 0;
+
+    // 检查停止信号抑制
+    const inhibition = checkInhibition(blackboard, agentId, dir);
+    const effectiveConc = inhibition.effectiveConcentration || rawConc;
+
+    // 【关键】计算响应概率
+    const responseProb = responseProbability(effectiveConc, threshold);
+
+    return {
+      direction: dir,
+      rawConcentration: rawConc,
+      effectiveConcentration: effectiveConc,
+      responseProbability: responseProb,
+      shouldExplore: Math.random() < responseProb,
+      inhibition: inhibition
+    };
+  });
+
+  // 返回决策结果（用于round_start消息）
+  return {
+    agentId,
+    threshold,
+    decisions,
+    recommendation: decisions.sort((a, b) => b.responseProbability - a.responseProbability)[0]
+  };
+}
+
+// 在broadcastRoundStart中使用
+async function broadcastRoundStart(round, blackboard) {
+  for (let agentId in blackboard.metadata.agentStates) {
+    const state = blackboard.metadata.agentStates[agentId];
+    if (state.status !== "active") continue;
+
+    // 获取所有方向
+    const directions = Object.keys(blackboard.metadata.pheromones);
+
+    // 【v2.3关键】计算阈值响应决策
+    const decision = calculateAgentDecision(blackboard, agentId, directions);
+
+    // 决定是否强制随机探索
+    const forceRandomExplore = Math.random() < state.randomExploreProb;
+
+    await SendMessage({
+      type: "message",
+      recipient: agentId,
+      content: JSON.stringify({
+        type: "round_start",
+        round: round,
+        agentState: state,
+        blackboardSnapshot: {
+          pheromones: blackboard.metadata.pheromones,
+          stopSignals: blackboard.metadata.stopSignals,
+          findings: blackboard.metadata.findings
+        },
+        // 【v2.3新增】决策辅助信息
+        decisionSupport: {
+          threshold: state.internalThreshold,
+          topDirections: decision.decisions.slice(0, 3),
+          forceRandomExplore: forceRandomExplore
+        },
+        instructions: {
+          forceRandomExplore: forceRandomExplore,
+          recommendedDirection: forceRandomExplore ? null : decision.recommendation.direction
+        }
+      }),
+      summary: `Round ${round} 开始`
+    });
+  }
+  markStepCompleted("ROUND", "broadcast_round_start");
+}
+```
+
+### 9.0.8 状态同步协议
 
 ```javascript
 // 任务完成时必须执行
@@ -1758,9 +2494,22 @@ T3: Synthesizer × 3, DeepAnalyst × 2, Debater × 1
 | v2.1 | 2026-02-17 | 黑板代理、状态托管、多轮迭代、超时降级、角色触发器、StopSignal协议、独特Agent命名 |
 | v2.1.1 | 2026-02-18 | 强制清理机制、同步屏障、最少轮数限制、黑板操作执行清单、shutdown超时配置 |
 | v2.1.2 | 2026-02-18 | Web搜索降级、Agent状态恢复、空闲碰撞机制、轮次恢复机制 |
-| **v2.2** | 2026-02-18 | **理论符合性修复**：状态同步协议、三阶段关闭、停止信号强化、强制随机探索、角色转换执行、多样性保护 |
+| v2.2 | 2026-02-18 | 理论符合性修复：状态同步协议、三阶段关闭、停止信号强化、强制随机探索、角色转换执行、多样性保护 |
+| **v2.3** | 2026-02-18 | **执行层修复**：执行状态机、黑板操作队列、信息素真实化、强制终止机制、沉默检测恢复、收敛计算器 |
 
-### v2.2 重点改进
+### v2.3 重点改进（执行层修复）
+
+| 问题 | 修复 |
+|------|------|
+| 黑板代理未执行 | ✅ 操作队列+确认机制，必须返回operation_result |
+| 信息素虚假 | ✅ 只能通过Agent的deposit_pheromone修改 |
+| Shutdown第三阶段未执行 | ✅ 强制终止，必须标记terminated |
+| 阈值响应未应用 | ✅ 决策时强制计算responseProbability |
+| Agent沉默 | ✅ 沉默检测+强制唤醒+降级 |
+| 收敛无计算 | ✅ CONVERGENCE_CALCULATOR输出具体数值 |
+| Orchestrator跳过步骤 | ✅ 执行状态机，每步必须确认 |
+
+### v2.2 重点改进（理论符合性）
 
 | 问题 | 修复 |
 |------|------|
@@ -2511,44 +3260,436 @@ async function recoverRound(blackboard, failedAgents) {
 
 ---
 
-### 14.6 更新后的检查清单 (v2.2)
+### 14.6 更新后的检查清单 (v2.3)
 
 每次运行Swarm时，Orchestrator必须完成以下步骤：
 
 #### 初始化阶段
-- [ ] TeamCreate 创建团队
-- [ ] TaskCreate 创建黑板（不设置owner）
-- [ ] 初始化 agentStates（包含内在阈值和随机探索概率）
-- [ ] 启动所有Explorer Agent
+- [ ] `create_team` - TeamCreate 创建团队
+- [ ] `create_blackboard` - TaskCreate 创建黑板（不设置owner）
+- [ ] `init_agent_states` - 初始化所有Agent状态（包含内在阈值和随机探索概率）
+- [ ] `spawn_agents` - 启动所有Explorer Agent
+- [ ] **【v2.3】assertPhaseCompleted("INIT")**
 
 #### 每轮执行
-- [ ] 广播 round_start（包含agentState、黑板快照和**v2.2强制指令**）
-- [ ] **【v2.2】计算forceRandomExplore并包含在instructions中**
-- [ ] **【v2.2】检查停止信号抑制，设置mustSwitchDirection**
-- [ ] 等待Agent响应（使用同步屏障）
-- [ ] 检测空闲Agent，发送碰撞邀请
-- [ ] 检测interrupted Agent，尝试恢复
-- [ ] 处理所有 blackboard_operation 请求
-- [ ] **【v2.2】停止信号立即降低目标信息素浓度**
-- [ ] 处理 collision_response（如有）
-- [ ] 使用 TaskUpdate 更新黑板 metadata
-- [ ] 返回 operation_result 给每个Agent
-- [ ] 执行轮次结算
-- [ ] **【v2.2】强制检查并执行角色转换，立即通知Agent**
-- [ ] **【v2.2】检查多样性保护，必要时触发保护动作**
-- [ ] 检查收敛（**至少3轮**后才可收敛，共识率≤90%）
+- [ ] `broadcast_round_start` - 发送轮次开始（含决策辅助）
+- [ ] `wait_responses` - 等待Agent响应（使用同步屏障）
+- [ ] **【v2.3】检测沉默Agent，发送force_wake**
+- [ ] `process_operations` - **处理所有blackboard_operation**
+- [ ] **【v2.3】验证操作队列：pending === processed + failed**
+- [ ] `return_results` - **返回operation_result给每个Agent**
+- [ ] `update_blackboard` - 使用TaskUpdate更新黑板
+- [ ] `settle_round` - 信息素蒸发、清理信号
+- [ ] **【v2.3】检查角色转换，发送role_transition_executed**
+- [ ] `check_convergence` - 检查收敛（使用CONVERGENCE_CALCULATOR）
+- [ ] **【v2.3】输出收敛计算具体数值**
+- [ ] **【v2.3】markStepCompleted("ROUND", "round_N")**
 
 #### 收敛/完成阶段
-- [ ] **【v2.2】执行状态同步协议：标记黑板completed，更新所有Agent状态**
-- [ ] **【v2.2】记录完成事件到黑板metadata.events**
-- [ ] 生成最终报告
+- [ ] **【v2.3】使用CONVERGENCE_CALCULATOR.evaluate()判断**
+- [ ] **【v2.3】输出calculationDetails**
+- [ ] `state_sync` - 执行状态同步协议
+- [ ] `generate_report` - 生成最终报告
+- [ ] **【v2.3】assertPhaseCompleted("CONVERGENCE")**
 
-#### 清理阶段（三阶段关闭）
-- [ ] **【v2.2】阶段1：预通知 shutdown_imminent（5秒）**
-- [ ] **【v2.2】阶段2：优雅关闭 shutdown_request（15秒）**
-- [ ] **【v2.2】阶段3：强制终止，标记Agent为terminated**
-- [ ] 删除团队目录
+#### 清理阶段（三阶段关闭 - 必须全部执行）
+- [ ] `pre_notify` - 阶段1：预通知 shutdown_imminent（5秒）
+- [ ] `graceful_request` - 阶段2：优雅关闭 shutdown_request（15秒）
+- [ ] **【v2.3】`force_terminate` - 阶段3：强制终止未响应Agent**
+- [ ] **【v2.3】`mark_all_terminated` - 验证所有Agent状态为terminated**
+- [ ] `update_blackboard_final` - 更新最终黑板状态
+- [ ] **【v2.3】assertPhaseCompleted("SHUTDOWN")**
+- [ ] TeamDelete 删除团队
 
 ---
 
-*Swarm v2.2 - 基于群体智能理论的自组织协作系统 | 理论符合性修复版本*
+### 14.7 v2.3 Orchestrator执行强制规则
+
+```markdown
+## 【v2.3 强制执行规则】
+
+### 1. 黑板代理必须执行
+- 收到 blackboard_operation → 立即处理 → 返回 operation_result
+- 验证: pending === processed + failed
+
+### 2. 信息素必须真实
+- 禁止: 直接设置 pheromones[dir].concentration = X
+- 必须: 通过 Agent 的 deposit_pheromone 操作
+
+### 3. Shutdown第三阶段必须执行
+- 即使所有Agent优雅关闭，也要执行 force_terminate
+- 验证: 所有 agentStates.status === "terminated"
+
+### 4. 收敛必须计算
+- 禁止: 声称收敛但无计算过程
+- 必须: 使用 CONVERGENCE_CALCULATOR.evaluate()
+- 输出: calculationDetails 包含具体数值
+
+### 5. 每步必须确认
+- 每个关键步骤后: markStepCompleted(phase, step)
+- 进入下一阶段前: assertPhaseCompleted(phase)
+```
+
+---
+
+## 十五、v2.4 新增协议（强制执行 + 研究归档）
+
+### 15.1 v2.4 核心改进
+
+| 改进 | 说明 |
+|------|------|
+| **强制黑板代理** | Agent **必须**通过SendMessage发送操作，禁止在报告中声明 |
+| **强制阈值计算** | 决策报告 **必须** 包含P(S,θ)计算过程和数值 |
+| **强制冲突审查** | 每轮 **必须** 提交冲突审查报告，无冲突也要声明 |
+| **合规性检查器** | `AGENT_COMPLIANCE_CHECKER` 验证Agent行为 |
+| **违规处理器** | `VIOLATION_HANDLER` 累计违规分数，触发降级/终止 |
+| **运行目录管理** | 每次运行创建独立目录，自动生成研究报告 |
+
+### 15.2 运行目录结构（v2.4新增）
+
+```
+swarm-runs/
+├── .template/                    # 模板目录
+│   ├── README.md                 # 目录说明
+│   └── report-template.md        # 报告模板
+│
+├── 2026-02-18-task-slug/         # 按日期+任务命名
+│   ├── run-config.json           # 运行配置
+│   ├── blackboard.json           # 黑板最终状态
+│   ├── operation-log.json        # 操作日志
+│   ├── agent-reports/            # Agent报告
+│   │   ├── round-1/
+│   │   │   ├── TanWei.md
+│   │   │   └── ...
+│   │   ├── round-2/
+│   │   └── round-3/
+│   ├── convergence-report.md     # 收敛报告
+│   └── final-research-report.md  # 最终研究成果
+│
+└── ...
+```
+
+### 15.3 Agent合规性检查器（v2.4核心）
+
+```javascript
+const AGENT_COMPLIANCE_CHECKER = {
+  checks: {
+    // C1: 黑板操作必须通过SendMessage
+    blackboardOperationViaMessage: {
+      validate: (roundReport, operationLog) => {
+        const reported = roundReport.confirmedOperations || [];
+        const actual = operationLog.filter(op => op.from === roundReport.agentId);
+
+        for (let op of reported) {
+          const found = actual.find(a => a.operationId === op.operationId);
+          if (!found) {
+            return {
+              valid: false,
+              violation: "reported_operation_not_found",
+              operationId: op.operationId
+            };
+          }
+        }
+        return { valid: true };
+      }
+    },
+
+    // C2: 决策报告必须包含阈值计算
+    decisionReportRequired: {
+      validate: (roundReport, agentState) => {
+        const decision = roundReport.decisionReport;
+        if (!decision) {
+          return { valid: false, violation: "decision_report_missing" };
+        }
+
+        const required = ["threshold", "candidates", "selectedDirection", "selectionReason"];
+        for (let field of required) {
+          if (!decision[field]) {
+            return { valid: false, violation: `decision_report_missing_${field}` };
+          }
+        }
+
+        // 验证响应概率计算
+        for (let candidate of decision.candidates) {
+          const expectedProb = Math.pow(candidate.concentration, 2) /
+            (Math.pow(candidate.concentration, 2) + Math.pow(decision.threshold, 2));
+
+          if (Math.abs(candidate.responseProb - expectedProb) > 0.01) {
+            return {
+              valid: false,
+              violation: "response_prob_calculation_error",
+              expected: expectedProb,
+              actual: candidate.responseProb
+            };
+          }
+        }
+        return { valid: true };
+      }
+    },
+
+    // C3: 冲突审查报告必须存在
+    conflictReviewRequired: {
+      validate: (roundReport, blackboardSnapshot) => {
+        const review = roundReport.conflictReview;
+        if (!review) {
+          return { valid: false, violation: "conflict_review_missing" };
+        }
+        return { valid: true };
+      }
+    },
+
+    // C4: 随机探索必须执行
+    randomExploreEnforced: {
+      validate: (roundReport, instructions) => {
+        if (instructions.forceRandomExplore) {
+          if (!roundReport.randomExploreForced) {
+            return { valid: false, violation: "random_explore_not_executed" };
+          }
+        }
+        return { valid: true };
+      }
+    }
+  },
+
+  runChecks: (roundReport, context) => {
+    const results = [];
+    for (let [checkName, check] of Object.entries(AGENT_COMPLIANCE_CHECKER.checks)) {
+      const result = check.validate(roundReport, context);
+      results.push({ check: checkName, ...result });
+    }
+    return {
+      agentId: roundReport.agentId,
+      round: roundReport.round,
+      compliant: results.every(r => r.valid),
+      violations: results.filter(r => !r.valid),
+      results
+    };
+  }
+};
+```
+
+### 15.4 违规处理器（v2.4核心）
+
+```javascript
+const VIOLATION_HANDLER = {
+  levels: {
+    WARNING: { score: 1, action: "record_only" },
+    MINOR: { score: 3, action: "reduce_pheromone_weight" },
+    MAJOR: { score: 5, action: "degrade_agent" },
+    CRITICAL: { score: 10, action: "force_terminate" }
+  },
+
+  violationSeverity: {
+    "reported_operation_not_found": "MAJOR",
+    "decision_report_missing": "MAJOR",
+    "decision_report_missing_threshold": "MINOR",
+    "response_prob_calculation_error": "MINOR",
+    "conflict_review_missing": "MINOR",
+    "random_explore_not_executed": "MAJOR"
+  },
+
+  handle: async (blackboard, agentId, violations) => {
+    const state = blackboard.metadata.agentStates[agentId];
+    state.violations = state.violations || [];
+    state.violationScore = state.violationScore || 0;
+
+    for (let violation of violations) {
+      const severity = VIOLATION_HANDLER.violationSeverity[violation.violation] || "WARNING";
+      const level = VIOLATION_HANDLER.levels[severity];
+
+      state.violations.push({ ...violation, severity, timestamp: Date.now() });
+      state.violationScore += level.score;
+
+      console.log(`[COMPLIANCE] ${agentId} ${severity}: ${violation.violation}`);
+
+      if (level.action === "degrade_agent" && state.status === "active") {
+        state.status = "degraded";
+      }
+
+      if (level.action === "force_terminate" || state.violationScore >= 15) {
+        state.status = "terminated";
+        state.terminationReason = "compliance_violation";
+      }
+    }
+    return state;
+  }
+};
+```
+
+### 15.5 自动强制终止机制（v2.4核心）
+
+```javascript
+const AUTO_FORCE_TERMINATE = {
+  triggers: {
+    shutdownRequestTimeout: 30000,
+    maxShutdownRetries: 3,
+    agentSilentTime: 120000
+  },
+
+  execute: async (teamName, blackboardId, agentId) => {
+    console.log(`[FORCE TERMINATE] 自动终止 ${agentId}`);
+
+    // 1. 更新黑板状态
+    const blackboard = await getBlackboard(blackboardId);
+    if (blackboard.metadata.agentStates[agentId]) {
+      blackboard.metadata.agentStates[agentId].status = "terminated";
+      blackboard.metadata.agentStates[agentId].terminatedAt = Date.now();
+      blackboard.metadata.agentStates[agentId].terminationReason = "auto_forced";
+    }
+
+    // 2. 更新团队配置
+    const configPath = `~/.claude/teams/${teamName}/config.json`;
+    const config = JSON.parse(await readFile(configPath));
+    const agentIndex = config.members.findIndex(m => m.name === agentId);
+
+    if (agentIndex >= 0) {
+      const [agent] = config.members.splice(agentIndex, 1);
+      config.terminatedMembers = config.terminatedMembers || [];
+      config.terminatedMembers.push({
+        ...agent,
+        terminatedAt: Date.now(),
+        terminationReason: "auto_forced"
+      });
+    }
+
+    await writeFile(configPath, JSON.stringify(config, null, 2));
+    console.log(`[FORCE TERMINATE] ✓ ${agentId} 已自动终止`);
+
+    return { success: true, agentId, method: "auto_forced" };
+  },
+
+  checkAndTerminate: async (teamName, blackboardId) => {
+    const blackboard = await getBlackboard(blackboardId);
+    const results = [];
+
+    for (let [agentId, state] of Object.entries(blackboard.metadata.agentStates)) {
+      if (state.status === "terminated") continue;
+      const silentTime = Date.now() - (state.lastActiveAt || 0);
+
+      if (silentTime > AUTO_FORCE_TERMINATE.triggers.agentSilentTime) {
+        const result = await AUTO_FORCE_TERMINATE.execute(teamName, blackboardId, agentId);
+        results.push(result);
+      }
+    }
+    return results;
+  }
+};
+```
+
+### 15.6 运行目录管理器（v2.4核心）
+
+```javascript
+const RUN_DIRECTORY_MANAGER = {
+  createRunDirectory: async (taskName) => {
+    const date = new Date().toISOString().slice(0, 10);
+    const taskSlug = taskName.toLowerCase().replace(/[^a-z0-9\u4e00-\u9fff]+/g, '-').slice(0, 30);
+    const runId = `${date}-${taskSlug}`;
+    const runPath = `swarm-runs/${runId}`;
+
+    await Bash(`mkdir -p "${runPath}/agent-reports"`);
+    return { runId, runPath };
+  },
+
+  saveRunConfig: async (runPath, config) => {
+    await writeFile(`${runPath}/run-config.json`, JSON.stringify(config, null, 2));
+  },
+
+  saveBlackboard: async (runPath, blackboard) => {
+    await writeFile(`${runPath}/blackboard.json`, JSON.stringify(blackboard, null, 2));
+  },
+
+  generateFinalReport: async (runPath, blackboard, convergenceResult, task) => {
+    // 生成人类可读的研究报告
+    const report = generateMarkdownReport(blackboard, convergenceResult, task);
+    await writeFile(`${runPath}/final-research-report.md`, report);
+    return `${runPath}/final-research-report.md`;
+  }
+};
+```
+
+---
+
+### 15.7 更新后的检查清单 (v2.4)
+
+#### 初始化阶段
+- [ ] `create_run_directory` - 创建运行目录
+- [ ] `create_team` - TeamCreate 创建团队
+- [ ] `create_blackboard` - TaskCreate 创建黑板（含runPath）
+- [ ] `init_agent_states` - 初始化所有Agent状态（含违规分数）
+- [ ] `spawn_agents` - 启动所有Explorer Agent
+- [ ] **【v2.4】saveRunConfig** - 保存运行配置
+
+#### 每轮执行
+- [ ] `broadcast_round_start` - 发送轮次开始
+- [ ] `wait_responses` - 等待Agent响应
+- [ ] **【v2.4】runComplianceChecks** - 运行合规性检查
+- [ ] **【v2.4】handleViolations** - 处理违规（如有）
+- [ ] `process_operations` - 处理blackboard_operation
+- [ ] `return_results` - 返回operation_result
+- [ ] `settle_round` - 轮次结算
+- [ ] **【v2.4】saveAgentReports** - 保存Agent报告
+
+#### 收敛/完成阶段
+- [ ] `check_convergence` - 使用CONVERGENCE_CALCULATOR
+- [ ] `generate_convergence_report` - 生成收敛报告
+- [ ] **【v2.4】generateFinalReport** - 生成最终研究报告
+- [ ] `state_sync` - 状态同步
+
+#### 清理阶段
+- [ ] `pre_notify` - 预通知
+- [ ] `graceful_request` - 优雅关闭
+- [ ] **【v2.4】auto_force_terminate** - 自动强制终止
+- [ ] **【v2.4】saveBlackboard** - 保存黑板最终状态
+- [ ] TeamDelete 删除团队
+
+---
+
+### 15.8 v2.4 Orchestrator执行强制规则
+
+```markdown
+## 【v2.4 强制执行规则】
+
+### 1. Agent必须通过SendMessage操作黑板
+- 禁止: 在round_complete报告中声明操作
+- 必须: 通过SendMessage发送blackboard_operation
+- 验证: AGENT_COMPLIANCE_CHECKER.blackboardOperationViaMessage
+
+### 2. 决策报告必须包含阈值计算
+- 必须: decisionReport.threshold, candidates, selectedDirection
+- 必须: 候选方向的responseProb = S²/(S²+θ²)
+- 验证: AGENT_COMPLIANCE_CHECKER.decisionReportRequired
+
+### 3. 冲突审查必须每轮执行
+- 必须: 每轮提交conflictReview报告
+- 即使无冲突也必须声明: { conflictsFound: 0 }
+- 验证: AGENT_COMPLIANCE_CHECKER.conflictReviewRequired
+
+### 4. 违规累计触发惩罚
+- MAJOR违规: +5分，触发降级
+- 累计≥15分: 强制终止
+- 验证: VIOLATION_HANDLER
+
+### 5. 研究成果必须归档
+- 必须: 创建运行目录
+- 必须: 生成final-research-report.md
+- 验证: 检查文件存在
+```
+
+---
+
+## 十六、版本历史
+
+| 版本 | 日期 | 主要改进 |
+|------|------|----------|
+| v1.0 | 2024 | 基础并行探索 + 视角菜单 |
+| v2.0 | 2026-02 | 数字信息素、交叉抑制、量化共识、动态角色 |
+| v2.1 | 2026-02-17 | 黑板代理、状态托管、多轮迭代、超时降级 |
+| v2.1.1 | 2026-02-18 | 强制清理、同步屏障、最少轮数限制 |
+| v2.1.2 | 2026-02-18 | Web搜索降级、Agent恢复、空闲碰撞 |
+| v2.2 | 2026-02-18 | 理论符合性修复：状态同步、三阶段关闭、停止信号强化 |
+| v2.3 | 2026-02-18 | 执行层修复：操作队列、信息素真实化、收敛计算器 |
+| **v2.4** | 2026-02-18 | **强制协议执行** + **合规检查器** + **运行目录管理** + **研究报告生成** |
+
+---
+
+*Swarm v2.4 - 基于群体智能理论的自组织协作系统 | 强制执行版本*
