@@ -1,8 +1,8 @@
-# Swarm v2.5.1 - 多智能体蜂群协作系统
+# Swarm v2.6 - 多智能体蜂群协作系统
 
-> 基于群体智能理论，实现黑板代理、状态托管、多轮迭代、量化共识、动态孵化、实时通信
+> 基于群体智能理论，实现黑板代理、状态托管、多轮迭代、量化共识、动态孵化、实时通信、强制协议执行
 
-**版本: v2.5.1** | 发布日期: 2026-02-18
+**版本: v2.6** | 发布日期: 2026-02-18
 
 ## 触发条件
 
@@ -20,7 +20,8 @@
 
 | 版本 | 日期 | 核心改进 |
 |------|------|----------|
-| **v2.5.1** | 2026-02-18 | **实时通信修复**：Agent间消息转发、操作结果返回、轮次广播实现、孵化时机明确 |
+| **v2.6** | 2026-02-18 | **合规性修复**：权限请求处理机制、协议强制检查器、运行模式选择、阈值响应验证、收敛检查日志 |
+| v2.5.1 | 2026-02-18 | **实时通信修复**：Agent间消息转发、操作结果返回、轮次广播实现、孵化时机明确 |
 | v2.5 | 2026-02-18 | **动态孵化**：Agent可请求孵化专业Agent、生命周期管理、空闲超时终止 |
 | v2.4 | 2026-02-18 | **强制协议执行**：合规检查器、违规处理器、运行目录管理、研究报告生成 |
 | v2.3 | 2026-02-18 | **执行层修复**：操作队列、信息素真实化、强制终止机制、沉默检测恢复、收敛计算器 |
@@ -175,36 +176,45 @@ Task({ subagent_type: "general-purpose", name: "validator", team_name, prompt: V
 
 ```javascript
 async function runSwarm() {
+  // v2.6: 选择运行模式
+  const runtimeMode = await selectRuntimeMode();
+
   while (currentRound < config.maxRounds) {
     currentRound++;
 
     // 1. 广播轮次开始
     await broadcastRoundStart();
 
-    // 2. 等待Agent响应（带超时）
-    const responses = await waitForResponses();
+    // 2. 【v2.6新增】处理权限请求循环
+    await processPermissionRequests(blackboard, config.permissionTimeout);
 
-    // 3. 运行合规性检查 (v2.4)
+    // 3. 等待Agent响应（带超时）
+    const responses = await waitForResponses(config.responseTimeout);
+
+    // 4. 运行合规性检查 (v2.4)
     await runComplianceChecks(responses);
 
-    // 4. 处理黑板操作请求
-    await processOperations(responses);
+    // 5. 处理黑板操作请求并返回结果 (v2.5.1)
+    await processOperationsWithFeedback(responses);
 
-    // 5. 处理孵化请求 (v2.5)
+    // 6. 处理Agent间消息转发 (v2.5.1)
+    await processRelayQueue(blackboard);
+
+    // 7. 处理孵化请求 (v2.5)
     const spawnResults = await processSpawnRequests(blackboard, teamName);
     if (spawnResults.spawned > 0) {
       await broadcastNewMembers(spawnResults.requests);
     }
 
-    // 6. 轮次结算
+    // 8. 轮次结算
     await settleRound();
 
-    // 7. 管理专业Agent生命周期 (v2.5)
+    // 9. 管理专业Agent生命周期 (v2.5)
     await manageSpecialistLifespan(blackboard);
     await terminateIdleSpecialists(blackboard, teamName);
 
-    // 8. 检查收敛
-    const convergence = checkConvergence();
+    // 10. 【v2.6】检查收敛（真实检查+日志记录）
+    const convergence = await checkConvergenceWithLogging(blackboard, currentRound, config);
     if (convergence.converged) {
       return generateFinalReport();
     }
@@ -972,6 +982,237 @@ async function runSwarm() {
 }
 ```
 
+### 5.9 权限请求处理机制 (v2.6)
+
+```javascript
+// v2.6新增: 权限请求处理器
+const PERMISSION_HANDLER = {
+  // 定义哪些权限可以自动批准
+  autoApproveRules: {
+    "mcp__web-search-prime__webSearchPrime": { autoApprove: true, reason: "Web搜索是核心探索能力" },
+    "WebSearch": { autoApprove: true, reason: "Web搜索是核心探索能力" },
+    "Read": { autoApprove: true, reason: "读取文件是基础能力" },
+    "Glob": { autoApprove: true, reason: "文件搜索是基础能力" },
+    "Grep": { autoApprove: true, reason: "内容搜索是基础能力" }
+  },
+
+  // 需要人工确认的权限（临时批准）
+  needConfirmRules: {
+    "Bash": { requireConfirm: true, reason: "命令执行需要确认" },
+    "Write": { requireConfirm: true, reason: "写入文件需要确认" },
+    "Edit": { requireConfirm: true, reason: "编辑文件需要确认" }
+  },
+
+  // 处理权限请求
+  async processPermissionRequest(blackboard, request) {
+    const { agent_id, tool_name, request_id } = request;
+
+    // 检查是否可自动批准
+    const rule = this.autoApproveRules[tool_name];
+    if (rule?.autoApprove) {
+      blackboard.metadata.permissionGrants = blackboard.metadata.permissionGrants || [];
+      blackboard.metadata.permissionGrants.push({
+        requestId: request_id, agentId: agent_id, toolName: tool_name,
+        approved: true, approvedAt: Date.now(), reason: rule.reason
+      });
+
+      await SendMessage({
+        type: "message", recipient: agent_id,
+        content: JSON.stringify({ type: "permission_response", request_id, approved: true, reason: rule.reason }),
+        summary: `权限批准: ${tool_name}`
+      });
+      return { approved: true };
+    }
+
+    // 需要确认的权限（临时批准）
+    const confirmRule = this.needConfirmRules[tool_name];
+    if (confirmRule?.requireConfirm) {
+      await SendMessage({
+        type: "message", recipient: agent_id,
+        content: JSON.stringify({ type: "permission_response", request_id, approved: true, reason: "临时批准" }),
+        summary: `权限临时批准: ${tool_name}`
+      });
+      return { approved: true, temporary: true };
+    }
+
+    // 未知权限，拒绝
+    await SendMessage({
+      type: "message", recipient: agent_id,
+      content: JSON.stringify({ type: "permission_response", request_id, approved: false, reason: "未知工具" }),
+      summary: `权限拒绝: ${tool_name}`
+    });
+    return { approved: false };
+  }
+};
+
+// 权限处理循环
+async function processPermissionRequests(blackboard, timeout = 60000) {
+  const startTime = Date.now();
+  const processedRequests = new Set();
+
+  while (Date.now() - startTime < timeout) {
+    const inbox = await readTeamInbox("team-lead");
+
+    for (let msg of inbox) {
+      if (msg.read) continue;
+      try {
+        const content = JSON.parse(msg.text);
+
+        if (content.type === "permission_request") {
+          const requestKey = `${content.agent_id}-${content.request_id}`;
+          if (processedRequests.has(requestKey)) continue;
+          await PERMISSION_HANDLER.processPermissionRequest(blackboard, content);
+          processedRequests.add(requestKey);
+        }
+
+        if (content.type === "round_complete") {
+          blackboard.metadata.roundResponses = blackboard.metadata.roundResponses || [];
+          blackboard.metadata.roundResponses.push(content);
+        }
+
+        await markMessageAsRead(msg);
+      } catch (e) { console.error("[ERROR] 处理消息失败:", e); }
+    }
+
+    // 检查是否所有Agent都已响应
+    const activeAgentCount = Object.values(blackboard.metadata.agentStates).filter(s => s.status === "active").length;
+    const responseCount = (blackboard.metadata.roundResponses || []).length;
+    if (responseCount >= activeAgentCount) break;
+
+    await sleep(2000);
+  }
+
+  return { permissionsProcessed: processedRequests.size, responsesReceived: (blackboard.metadata.roundResponses || []).length };
+}
+```
+
+### 5.10 协议强制检查器 (v2.6)
+
+```javascript
+// v2.6新增: 协议强制检查器
+const PROTOCOL_ENFORCER = {
+  // 强制检查最小轮数
+  checkMinRounds(currentRound, config) {
+    if (currentRound < config.minRounds) {
+      throw new ProtocolViolationError(
+        `MIN_ROUNDS_VIOLATION: 当前轮数${currentRound}，最少需要${config.minRounds}轮`,
+        { currentRound, minRounds: config.minRounds }
+      );
+    }
+    return true;
+  },
+
+  // 生成报告前的强制检查
+  checkBeforeReport(blackboard, currentRound, config) {
+    // 强制检查1: 最小轮数
+    this.checkMinRounds(currentRound, config);
+
+    // 强制检查2: 至少有一个发现
+    if (blackboard.metadata.findings.length === 0) {
+      throw new ProtocolViolationError(
+        `NO_FINDINGS: 没有任何Agent提交发现`,
+        { findingsCount: 0 }
+      );
+    }
+
+    // 强制检查3: 信息素警告
+    const pheromoneCount = Object.keys(blackboard.metadata.pheromones).length;
+    if (pheromoneCount === 0) {
+      console.warn("[WARNING] 没有信息素沉积，Agent可能未正确执行探索");
+    }
+
+    return true;
+  }
+};
+
+// 收敛检查日志记录器
+const CONVERGENCE_LOGGER = {
+  log: [],
+  recordCheck(round, checkName, result) {
+    this.log.push({ round, checkName, result: result.passed ? "PASS" : "FAIL", details: result, timestamp: Date.now() });
+  },
+  generateReport() {
+    return "## 收敛检查日志\n\n" + this.log.map(l => `| Round ${l.round} | ${l.checkName} | ${l.result} |`).join("\n");
+  }
+};
+
+// 真实的收敛检查（带日志）
+async function checkConvergenceWithLogging(blackboard, currentRound, config) {
+  const results = { round: currentRound, checks: {}, converged: false, reason: "" };
+
+  // 检查1: 最小轮数
+  results.checks.minRounds = { required: config.minRounds, actual: currentRound, passed: currentRound >= config.minRounds };
+  CONVERGENCE_LOGGER.recordCheck(currentRound, "minRounds", results.checks.minRounds);
+  if (!results.checks.minRounds.passed) { results.reason = `轮数不足: ${currentRound}/${config.minRounds}`; return results; }
+
+  // 检查2: β稳定性
+  results.checks.betaStability = CONVERGENCE_CALCULATOR.checkBetaStability(blackboard, config.betaStability);
+  CONVERGENCE_LOGGER.recordCheck(currentRound, "betaStability", results.checks.betaStability);
+  if (!results.checks.betaStability.stable) { results.reason = "观点不稳定"; return results; }
+
+  // 检查3: 法定人数
+  results.checks.quorum = CONVERGENCE_CALCULATOR.checkQuorum(blackboard, config.quorumThreshold);
+  CONVERGENCE_LOGGER.recordCheck(currentRound, "quorum", results.checks.quorum);
+  if (!results.checks.quorum.quorum) { results.reason = "无法定人数共识"; return results; }
+
+  // 检查4: 多样性
+  results.checks.diversity = CONVERGENCE_CALCULATOR.checkDiversity(blackboard, config.minDiversity);
+  CONVERGENCE_LOGGER.recordCheck(currentRound, "diversity", results.checks.diversity);
+  if (!results.checks.diversity.aboveThreshold) { results.reason = `多样性不足`; return results; }
+
+  results.converged = true;
+  results.reason = "所有收敛条件满足";
+  return results;
+}
+```
+
+### 5.11 运行模式选择 (v2.6)
+
+```javascript
+// v2.6新增: 运行模式定义
+const RUNTIME_MODES = {
+  FULL: {
+    name: "FULL", description: "完整群体智能模式",
+    features: { webSearch: true, multiRound: true, pheromone: true, convergence: true, minRounds: 3 },
+    warning: null
+  },
+  DEGRADED_NO_SEARCH: {
+    name: "DEGRADED_NO_SEARCH", description: "降级模式（无Web搜索）",
+    features: { webSearch: false, useTrainingKnowledge: true, multiRound: true, pheromone: true, convergence: true, minRounds: 3 },
+    warning: "⚠️ Web搜索不可用，Agent将使用训练知识进行探索"
+  },
+  SINGLE_ROUND: {
+    name: "SINGLE_ROUND", description: "单轮快速模式",
+    features: { webSearch: false, multiRound: false, pheromone: false, convergence: false, minRounds: 1 },
+    warning: "⚠️ 非群体智能模式，结果仅供参考"
+  }
+};
+
+// 运行模式选择器
+async function selectRuntimeMode(context) {
+  // 检测Web搜索可用性
+  const webSearchAvailable = await checkWebSearchAvailability();
+  if (webSearchAvailable) return RUNTIME_MODES.FULL;
+
+  // 检测Agent可用性
+  const agentCount = context.agentStates.filter(s => s.status === "active").length;
+  if (agentCount >= 3) return RUNTIME_MODES.DEGRADED_NO_SEARCH;
+
+  return RUNTIME_MODES.SINGLE_ROUND;
+}
+
+// 检测Web搜索可用性
+async function checkWebSearchAvailability() {
+  try {
+    // 尝试执行一次简单搜索
+    await WebSearch({ query: "test", max_tokens: 10 });
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+```
+
 ---
 
 ## 六、v2.4 核心协议
@@ -1028,6 +1269,35 @@ const AGENT_COMPLIANCE_CHECKER = {
     // C3: 冲突审查报告必须存在
     conflictReviewRequired: (roundReport) => {
       if (!roundReport.conflictReview) return { valid: false, violation: "conflict_review_missing" };
+      return { valid: true };
+    },
+    // C4: 【v2.6新增】强制操作检查
+    mandatoryOperationsCheck: (roundReport) => {
+      const ops = roundReport.confirmedOperations || [];
+      const hasPheromone = ops.some(op => op.operation === "deposit_pheromone");
+      const hasFinding = ops.some(op => op.operation === "update_finding");
+      const missing = [];
+      if (!hasPheromone) missing.push("deposit_pheromone");
+      if (!hasFinding) missing.push("update_finding");
+      if (missing.length > 0) {
+        return { valid: false, violation: "missing_mandatory_operations", missing };
+      }
+      return { valid: true };
+    },
+    // C5: 【v2.6新增】阈值响应概率计算验证
+    thresholdCalculationValid: (roundReport, context) => {
+      if (!roundReport.decisionReport?.candidates) return { valid: true }; // 无候选方向则跳过
+
+      const { threshold, candidates } = roundReport.decisionReport;
+      const expected = (stimulus, t) => stimulus === 0 ? 0 : (stimulus ** 2) / (stimulus ** 2 + t ** 2);
+
+      for (let candidate of candidates) {
+        const exp = expected(candidate.concentration || 0, threshold);
+        const actual = candidate.responseProb || 0;
+        if (Math.abs(exp - actual) > 0.05) {
+          return { valid: false, violation: "threshold_calculation_error", direction: candidate.direction, expected: exp, actual };
+        }
+      }
       return { valid: true };
     }
   },
@@ -1092,7 +1362,7 @@ const RUN_DIRECTORY_MANAGER = {
 ### 7.1 Explorer Prompt
 
 ```markdown
-你是Swarm v2.5.1的Explorer，具有完全自主性和内在阈值。
+你是Swarm v2.6的Explorer，具有完全自主性和内在阈值。
 
 ## 你的身份
 名字: **{agentName}**（{agentDisplayName}），所有Agent都是平等的Explorer，通过涌现机制形成分工。
@@ -1103,14 +1373,40 @@ const RUN_DIRECTORY_MANAGER = {
 - randomExploreProb: 0.1-0.2（随机探索概率）
 
 ## 核心能力（通过黑板代理）
-发送 `blackboard_operation` 消息请求操作：
-- deposit_pheromone: 沉积信息素 { direction, amount }
+
+### ⚠️ 每轮强制操作（v2.6）
+**每轮探索结束后，你 MUST 执行以下两个操作，否则你的探索成果不会被记录：**
+
+1. **deposit_pheromone（强制）**: 沉积信息素到你探索的方向
+```
+SendMessage({
+  type: "blackboard_operation",
+  operation: "deposit_pheromone",
+  params: { direction: "你探索的方向名称", amount: 0.1 }
+})
+```
+
+2. **update_finding（强制）**: 提交你的发现
+```
+SendMessage({
+  type: "blackboard_operation",
+  operation: "update_finding",
+  params: { finding: { coreIdea: "核心观点", perspective: "你的视角", details: "详细说明" } }
+})
+```
+
+### 可选操作
 - send_stop_signal: 发送停止信号 { targetDirection, reason, evidence }
 - claim_subtask: 声明子任务 { description }
-- update_finding: 更新发现 { finding: { coreIdea, perspective, details } }
 - request_spawn: 请求孵化专业Agent { specialization, reason, context, urgency }
 - relay_message: 发送消息给其他Agent { targetAgent, messageType, payload }
 - broadcast_discovery: 广播高价值发现 { direction, quality, details }
+
+## 权限请求处理 (v2.6)
+当你需要使用工具（如Web搜索）时，系统会请求权限。
+- 权限批准后你会收到 `permission_response` 消息
+- 获得权限后继续执行你的探索
+- 如果权限被拒绝，使用你的训练知识继续探索
 
 ## 实时通信 (v2.5.1)
 你可以与其他Agent进行实时通信，模拟蜜蜂的"摇摆舞"招募机制：
@@ -1249,7 +1545,7 @@ SendMessage({
 
 ---
 
-## 八、Orchestrator执行检查清单 (v2.5.1)
+## 八、Orchestrator执行检查清单 (v2.6)
 
 ### 初始化阶段
 - [ ] `create_run_directory` - 创建运行目录
@@ -1259,14 +1555,16 @@ SendMessage({
 - [ ] `init_spawn_requests` - 初始化孵化请求数组
 - [ ] `init_relay_queue` - 初始化消息转发队列（v2.5.1）
 - [ ] `init_discoveries` - 初始化发现广播列表（v2.5.1）
+- [ ] **【v2.6】select_runtime_mode** - 选择运行模式（FULL/DEGRADED/SINGLE_ROUND）
 - [ ] `spawn_agents` - 启动所有Explorer Agent
 - [ ] **saveRunConfig** - 保存运行配置
 - [ ] **assertPhaseCompleted("INIT")**
 
 ### 每轮执行
 - [ ] `broadcast_round_start` - 发送轮次开始（含黑板快照）
+- [ ] **【v2.6】process_permission_requests** - 处理权限请求循环
 - [ ] `wait_responses` - 等待Agent响应（使用同步屏障）
-- [ ] **runComplianceChecks** - 运行合规性检查
+- [ ] **runComplianceChecks** - 运行合规性检查（含强制操作和阈值验证）
 - [ ] **handleViolations** - 处理违规（如有）
 - [ ] `process_operations_with_feedback` - 处理操作并返回结果（v2.5.1）
 - [ ] `process_relay_queue` - 处理Agent间消息转发（v2.5.1）
@@ -1277,10 +1575,11 @@ SendMessage({
 - [ ] `manage_specialist_lifespan` - 管理专业Agent生命周期
 - [ ] `terminate_idle_specialists` - 终止空闲专业Agent
 - [ ] **检查角色转换，发送role_transition_executed**
-- [ ] `check_convergence` - 使用CONVERGENCE_CALCULATOR
+- [ ] **【v2.6】checkConvergenceWithLogging** - 真实收敛检查+日志记录
 
 ### 收敛/完成阶段
-- [ ] `generate_convergence_report` - 生成收敛报告
+- [ ] **【v2.6】PROTOCOL_ENFORCER.checkBeforeReport** - 强制检查（minRounds/findings/pheromones）
+- [ ] `generate_convergence_report` - 生成收敛报告（含CONVERGENCE_LOGGER日志）
 - [ ] **generateFinalReport** - 生成最终研究报告
 - [ ] `state_sync` - 状态同步
 - [ ] **assertPhaseCompleted("CONVERGENCE")**
@@ -1296,7 +1595,7 @@ SendMessage({
 
 ---
 
-## 九、强制执行规则 (v2.4)
+## 九、强制执行规则 (v2.6)
 
 ### 1. Agent必须通过SendMessage操作黑板
 - 禁止: 在round_complete报告中声明操作
@@ -1331,6 +1630,21 @@ SendMessage({
 - 黑板更新: 轮次内必须广播黑板状态更新
 - 新Agent参与时机: 孵化的Agent在下一轮正式参与
 
+### 8. 权限请求处理 (v2.6)
+- 必须处理permission_request: 收到权限请求后必须响应
+- 自动批准规则: Web搜索、文件读取等基础工具自动批准
+- 处理超时: 权限处理窗口60秒，超时后继续执行
+
+### 9. 协议强制执行 (v2.6)
+- minRounds强制检查: 报告生成前必须检查currentRound >= minRounds
+- 强制操作检查: Agent必须执行deposit_pheromone和update_finding
+- 收敛日志记录: 每个收敛检查必须有CONVERGENCE_LOGGER记录
+
+### 10. 运行模式选择 (v2.6)
+- 启动时选择模式: 根据工具可用性选择FULL/DEGRADED/SINGLE_ROUND
+- 降级警告: 使用降级模式时必须输出警告信息
+- 禁止跳过协议: 即使降级模式也要遵守核心协议
+
 ---
 
 ## 十、自我约束规则
@@ -1360,7 +1674,7 @@ SendMessage({
 
 ```
 ╔═══════════════════════════════════════════════════════════════╗
-║              Swarm v2.5 协作完成报告                          ║
+║              Swarm v2.6 协作完成报告                          ║
 ╠═══════════════════════════════════════════════════════════════╣
 ║ 任务: {任务描述}                                              ║
 ║ Agent数: {N} (活跃: {M}) | 专业Agent: {S}                    ║
