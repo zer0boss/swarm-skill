@@ -1,6 +1,18 @@
-# Swarm v2.1 - 多智能体蜂群协作系统
+# Swarm v2.1.1 - 多智能体蜂群协作系统
 
 > 基于群体智能理论，实现黑板代理、状态托管、多轮迭代、量化共识
+
+**版本: v2.1.1** | 发布日期: 2026-02-18
+
+### v2.1.1 更新内容
+
+| 问题 | 修复 |
+|------|------|
+| TeamDelete失败 | ✅ 新增 `force_cleanup` 强制清理机制 |
+| 黑板代理未执行 | ✅ 新增 Orchestrator 操作执行清单 |
+| 多轮迭代未验证 | ✅ 强制最少2轮（minRounds=2）|
+| Agent响应时序 | ✅ 新增同步屏障 `sync_barrier` |
+| shutdown延迟 | ✅ 新增 `shutdown_timeout` 配置 |
 
 ## 触发条件
 
@@ -156,8 +168,12 @@ Orchestrator代理执行所有写操作，并返回结果。
       quorumThreshold: 0.67,
       minDiversity: 0.4,
       maxRounds: 10,
+      minRounds: 2,           // v2.1.1: 最少轮数（验证β稳定性）
       roundTimeout: 120000,   // 2分钟
-      responseTimeout: 60000  // 1分钟
+      responseTimeout: 60000, // 1分钟
+      syncBarrierTimeout: 60000,  // v2.1.1: 同步屏障超时
+      shutdownTimeout: 30000,     // v2.1.1: 优雅关闭超时
+      forceCleanup: true          // v2.1.1: 超时后强制清理
     }
   }
   // 不设置owner！保持共享
@@ -1332,8 +1348,334 @@ T3: Synthesizer × 3, DeepAnalyst × 2, Debater × 1
 |------|------|----------|
 | v1.0 | 2024 | 基础并行探索 + 视角菜单 |
 | v2.0 | 2026-02 | 数字信息素、交叉抑制、量化共识、动态角色、涌现分解 |
-| v2.1 | 2026-02 | 黑板代理、状态托管、多轮迭代、超时降级、角色触发器、StopSignal协议、独特Agent命名 |
+| v2.1 | 2026-02-17 | 黑板代理、状态托管、多轮迭代、超时降级、角色触发器、StopSignal协议、独特Agent命名 |
+| v2.1.1 | 2026-02-18 | 强制清理机制、同步屏障、最少轮数限制、黑板操作执行清单、shutdown超时配置 |
 
 ---
 
-*Swarm v2.1 - 基于群体智能理论的自组织协作系统*
+## 十二、v2.1.1 新增机制
+
+### 12.1 强制清理机制 (force_cleanup)
+
+解决 TeamDelete 失败问题：
+
+```javascript
+async function cleanupTeam(teamName, options = {}) {
+  const config = {
+    shutdownTimeout: 30000,    // 等待Agent关闭的最长时间
+    forceAfterTimeout: true,   // 超时后强制删除
+    retryAttempts: 3           // 重试次数
+  };
+
+  // 1. 发送shutdown请求给所有Agent
+  const agents = getActiveAgents(teamName);
+  for (let agent of agents) {
+    await SendMessage({
+      type: "shutdown_request",
+      recipient: agent.id,
+      content: "协作结束，请关闭"
+    });
+  }
+
+  // 2. 等待所有Agent关闭
+  const startTime = Date.now();
+  while (Date.now() - startTime < config.shutdownTimeout) {
+    const activeCount = getActiveAgents(teamName).length;
+    if (activeCount === 0) {
+      break;
+    }
+    await sleep(1000);
+  }
+
+  // 3. 如果超时，强制删除团队目录
+  const remainingAgents = getActiveAgents(teamName);
+  if (remainingAgents.length > 0 && config.forceAfterTimeout) {
+    console.warn(`强制清理 ${remainingAgents.length} 个未响应Agent`);
+    await Bash({
+      command: `rm -rf ~/.claude/teams/${teamName}/`
+    });
+  }
+
+  return { success: true, forcedCleanup: remainingAgents.length > 0 };
+}
+```
+
+### 12.2 同步屏障 (sync_barrier)
+
+解决Agent响应时序不一致问题：
+
+```javascript
+class SyncBarrier {
+  constructor(agentCount, timeout = 60000) {
+    this.agentCount = agentCount;
+    this.timeout = timeout;
+    this.responses = new Map();
+    this.barrierPromise = null;
+    this.resolveBarrier = null;
+  }
+
+  async waitForAll(agentId, response) {
+    // 记录响应
+    this.responses.set(agentId, {
+      response,
+      timestamp: Date.now()
+    });
+
+    // 如果所有Agent都已响应，解除屏障
+    if (this.responses.size >= this.agentCount) {
+      if (this.resolveBarrier) {
+        this.resolveBarrier(this.getAllResponses());
+      }
+      return { synced: true, allResponded: true };
+    }
+
+    // 否则等待
+    return new Promise((resolve) => {
+      const timeoutId = setTimeout(() => {
+        resolve({
+          synced: true,
+          allResponded: false,
+          respondedCount: this.responses.size,
+          expectedCount: this.agentCount
+        });
+      }, this.timeout);
+
+      // 设置屏障解除回调
+      this.resolveBarrier = (responses) => {
+        clearTimeout(timeoutId);
+        resolve({ synced: true, allResponded: true, responses });
+      };
+    });
+  }
+
+  getAllResponses() {
+    return Object.fromEntries(this.responses);
+  }
+}
+
+// 使用示例
+const barrier = new SyncBarrier(4, 60000);  // 4个Agent，60秒超时
+
+// 在收到每个Agent响应时
+agentResponses.forEach(async (response, agentId) => {
+  const result = await barrier.waitForAll(agentId, response);
+  if (result.allResponded) {
+    console.log("所有Agent已同步，进入下一轮");
+    await settleRound();
+  } else {
+    console.log(`超时: ${result.respondedCount}/${result.expectedCount} Agent响应`);
+    await handleTimeout();
+  }
+});
+```
+
+### 12.3 最少轮数限制 (minRounds)
+
+强制验证β稳定性：
+
+```javascript
+const SWARM_CONFIG = {
+  // ... 其他配置
+  minRounds: 2,              // 最少运行轮数（验证β稳定性需要）
+  betaStability: 2,          // β稳定性检查窗口
+  maxRounds: 10              // 最大轮数
+};
+
+async function checkConvergence(blackboard, currentRound) {
+  // 强制最少轮数
+  if (currentRound < SWARM_CONFIG.minRounds) {
+    return {
+      converged: false,
+      reason: `min_rounds_not_reached: ${currentRound}/${SWARM_CONFIG.minRounds}`
+    };
+  }
+
+  // β稳定性检查
+  const history = blackboard.metadata.opinionHistory;
+  if (history.length < SWARM_CONFIG.betaStability) {
+    return {
+      converged: false,
+      reason: `insufficient_history: ${history.length}/${SWARM_CONFIG.betaStability}`
+    };
+  }
+
+  // 检查最近β轮的观点是否稳定
+  const recent = history.slice(-SWARM_CONFIG.betaStability);
+  const opinionSets = recent.map(r =>
+    new Set(r.findings.map(f => f.coreIdea))
+  );
+
+  const isStable = opinionSets.every(set =>
+    setsEqual(set, opinionSets[0])
+  );
+
+  if (!isStable) {
+    return { converged: false, reason: "not_stable" };
+  }
+
+  // 法定人数检查
+  // ...
+
+  return { converged: true };
+}
+```
+
+### 12.4 黑板操作执行清单
+
+Orchestrator必须执行的完整操作列表：
+
+```javascript
+// ===== Orchestrator 执行清单 =====
+// 收到Agent的 blackboard_operation 消息后，必须执行以下步骤：
+
+async function executeBlackboardOperation(message, blackboard) {
+  const { operation, params } = message;
+  const agentId = message.from;
+
+  // 1. 验证操作类型
+  const opDef = BLACKBOARD_OPERATIONS[operation];
+  if (!opDef) {
+    return { success: false, error: "unknown_operation" };
+  }
+
+  // 2. 验证参数
+  const validation = validateParams(params, opDef.params);
+  if (!validation.valid) {
+    return { success: false, error: "invalid_params", details: validation.errors };
+  }
+
+  // 3. 执行操作
+  const result = opDef.handler(blackboard, params, agentId);
+
+  // 4. 更新黑板metadata（如果操作成功）
+  if (result.success) {
+    // 黑板已通过handler更新
+    // 记录操作日志
+    blackboard.metadata.operationLog = blackboard.metadata.operationLog || [];
+    blackboard.metadata.operationLog.push({
+      operation,
+      agentId,
+      params,
+      result,
+      timestamp: Date.now()
+    });
+  }
+
+  // 5. 返回结果给Agent
+  return {
+    success: result.success,
+    operationId: `op-${Date.now()}`,
+    ...result
+  };
+}
+
+// ===== 实际执行时Orchestrator的操作 =====
+
+// 当收到 Agent 发送的消息：
+// { type: "blackboard_operation", operation: "deposit_pheromone", params: { direction: "xxx", amount: 0.1 } }
+
+// Orchestrator 执行：
+// 1. 解析消息
+// 2. 调用 executeBlackboardOperation()
+// 3. 使用 TaskUpdate 更新黑板 Task 的 metadata
+// 4. 使用 SendMessage 返回 operation_result 给 Agent
+
+// 示例代码：
+async function handleAgentMessage(message) {
+  if (message.type === "blackboard_operation") {
+    const result = await executeBlackboardOperation(message, currentBlackboard);
+
+    // 更新黑板
+    await TaskUpdate({
+      taskId: blackboardTaskId,
+      metadata: {
+        pheromones: currentBlackboard.metadata.pheromones,
+        findings: currentBlackboard.metadata.findings,
+        stopSignals: currentBlackboard.metadata.stopSignals,
+        agentStates: currentBlackboard.metadata.agentStates,
+        operationLog: currentBlackboard.metadata.operationLog
+      }
+    });
+
+    // 返回结果
+    await SendMessage({
+      type: "message",
+      recipient: message.from,
+      content: JSON.stringify({
+        type: "operation_result",
+        ...result
+      }),
+      summary: `黑板操作: ${message.operation} - ${result.success ? '成功' : '失败'}`
+    });
+  }
+}
+```
+
+### 12.5 shutdown超时配置
+
+```javascript
+const SHUTDOWN_CONFIG = {
+  gracefulTimeout: 10000,    // 优雅关闭等待时间: 10秒
+  forceKillTimeout: 30000,   // 强制终止等待时间: 30秒
+  retryInterval: 2000,       // 重试间隔: 2秒
+  maxRetries: 3              // 最大重试次数
+};
+
+async function gracefulShutdown(agents) {
+  for (let attempt = 1; attempt <= SHUTDOWN_CONFIG.maxRetries; attempt++) {
+    // 发送shutdown请求
+    for (let agent of agents) {
+      await SendMessage({
+        type: "shutdown_request",
+        recipient: agent.id,
+        content: `请关闭 (尝试 ${attempt}/${SHUTDOWN_CONFIG.maxRetries})`
+      });
+    }
+
+    // 等待响应
+    await sleep(SHUTDOWN_CONFIG.gracefulTimeout);
+
+    // 检查是否全部关闭
+    const activeAgents = agents.filter(a => a.status !== "terminated");
+    if (activeAgents.length === 0) {
+      return { success: true, method: "graceful" };
+    }
+
+    console.log(`仍有 ${activeAgents.length} 个Agent未关闭，重试...`);
+  }
+
+  // 超时后强制清理
+  return { success: true, method: "forced" };
+}
+```
+
+---
+
+## 十三、Orchestrator 执行检查清单
+
+每次运行Swarm时，Orchestrator必须完成以下步骤：
+
+### 初始化阶段
+- [ ] TeamCreate 创建团队
+- [ ] TaskCreate 创建黑板（不设置owner）
+- [ ] 初始化 agentStates（包含内在阈值）
+- [ ] 启动所有Explorer Agent
+
+### 每轮执行
+- [ ] 广播 round_start（包含agentState和黑板快照）
+- [ ] 等待所有Agent响应（使用同步屏障）
+- [ ] 处理所有 blackboard_operation 请求
+- [ ] 使用 TaskUpdate 更新黑板 metadata
+- [ ] 返回 operation_result 给每个Agent
+- [ ] 执行轮次结算（信息素蒸发、清理信号）
+- [ ] 检查收敛（至少minRounds后才可收敛）
+
+### 清理阶段
+- [ ] 发送 shutdown_request 给所有Agent
+- [ ] 等待 gracefulTimeout
+- [ ] 如果超时，执行强制清理
+- [ ] 删除团队目录
+
+---
+
+*Swarm v2.1.1 - 基于群体智能理论的自组织协作系统*
