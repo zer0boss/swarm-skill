@@ -1,8 +1,8 @@
-# Swarm v2.5 - 多智能体蜂群协作系统
+# Swarm v2.5.1 - 多智能体蜂群协作系统
 
-> 基于群体智能理论，实现黑板代理、状态托管、多轮迭代、量化共识、动态孵化
+> 基于群体智能理论，实现黑板代理、状态托管、多轮迭代、量化共识、动态孵化、实时通信
 
-**版本: v2.5.0** | 发布日期: 2026-02-18
+**版本: v2.5.1** | 发布日期: 2026-02-18
 
 ## 触发条件
 
@@ -20,7 +20,8 @@
 
 | 版本 | 日期 | 核心改进 |
 |------|------|----------|
-| **v2.5** | 2026-02-18 | **动态孵化**：Agent可请求孵化专业Agent、生命周期管理、空闲超时终止 |
+| **v2.5.1** | 2026-02-18 | **实时通信修复**：Agent间消息转发、操作结果返回、轮次广播实现、孵化时机明确 |
+| v2.5 | 2026-02-18 | **动态孵化**：Agent可请求孵化专业Agent、生命周期管理、空闲超时终止 |
 | v2.4 | 2026-02-18 | **强制协议执行**：合规检查器、违规处理器、运行目录管理、研究报告生成 |
 | v2.3 | 2026-02-18 | **执行层修复**：操作队列、信息素真实化、强制终止机制、沉默检测恢复、收敛计算器 |
 | v2.2 | 2026-02-18 | **理论符合性**：状态同步协议、三阶段关闭、停止信号强化、强制随机探索、角色转换执行、多样性保护 |
@@ -360,6 +361,75 @@ const BLACKBOARD_OPERATIONS = {
 
       return { success: true, status: "pending", message: "孵化请求已提交" };
     }
+  },
+
+  // v2.5.1: Agent间消息转发（模拟蜜蜂摇摆舞招募）
+  RELAY_MESSAGE: {
+    params: {
+      targetAgent: "string",       // 目标Agent ID，或 "broadcast" 广播
+      messageType: "string",       // recruit | challenge | support | query | notify
+      payload: {}                  // 消息内容
+    },
+    handler: (blackboard, params, agentId) => {
+      // 初始化消息队列
+      blackboard.metadata.relayQueue = blackboard.metadata.relayQueue || [];
+
+      const message = {
+        messageId: `msg-${Date.now()}`,
+        from: agentId,
+        to: params.targetAgent,
+        type: params.messageType,
+        payload: params.payload,
+        timestamp: Date.now()
+      };
+
+      blackboard.metadata.relayQueue.push(message);
+
+      // 记录发送统计
+      const state = blackboard.metadata.agentStates[agentId];
+      if (state) {
+        state.stats.messagesSent = (state.stats.messagesSent || 0) + 1;
+      }
+
+      return { success: true, messageId: message.messageId, queued: true };
+    }
+  },
+
+  // v2.5.1: 广播发现（类似摇摆舞的高价值信息广播）
+  BROADCAST_DISCOVERY: {
+    params: {
+      direction: "string",         // 发现的方向
+      quality: "number",           // 质量评分 0-1
+      details: "string"            // 详细描述
+    },
+    handler: (blackboard, params, agentId) => {
+      blackboard.metadata.discoveries = blackboard.metadata.discoveries || [];
+
+      const discovery = {
+        id: `discovery-${Date.now()}`,
+        from: agentId,
+        direction: params.direction,
+        quality: params.quality,
+        details: params.details,
+        timestamp: Date.now(),
+        recruitedAgents: []  // 被招募的Agent列表
+      };
+
+      blackboard.metadata.discoveries.push(discovery);
+
+      // 自动为高质量发现增加信息素
+      if (params.quality >= 0.7) {
+        const ph = blackboard.metadata.pheromones;
+        if (!ph[params.direction]) {
+          ph[params.direction] = { concentration: 0, depositedBy: [], createdAt: Date.now() };
+        }
+        ph[params.direction].concentration = Math.min(
+          ph[params.direction].concentration + params.quality * 0.2, 1.0
+        );
+      }
+
+      return { success: true, discoveryId: discovery.id };
+    }
   }
 };
 ```
@@ -649,6 +719,259 @@ async function terminateIdleSpecialists(blackboard, teamName) {
 }
 ```
 
+### 5.7 实时通信机制 (v2.5.1)
+
+```javascript
+// 广播轮次开始
+async function broadcastRoundStart(blackboard, currentRound) {
+  const roundInfo = {
+    type: "round_start",
+    round: currentRound,
+    timestamp: Date.now(),
+    instructions: {
+      forceRandomExplore: checkForceRandomExplore(blackboard),
+      mustSwitchDirections: getSuppressedDirections(blackboard)
+    },
+    pheromones: { ...blackboard.metadata.pheromones },  // 信息素快照
+    recentFindings: blackboard.metadata.findings.slice(-5),
+    recentDiscoveries: (blackboard.metadata.discoveries || []).slice(-3)
+  };
+
+  const results = { success: 0, failed: 0 };
+  for (let [agentId, state] of Object.entries(blackboard.metadata.agentStates)) {
+    if (state.status !== "active") continue;
+
+    try {
+      await SendMessage({
+        type: "message",
+        recipient: agentId,
+        content: JSON.stringify(roundInfo),
+        summary: `Round ${currentRound} 开始`
+      });
+      results.success++;
+    } catch (error) {
+      console.error(`[BROADCAST] 发送给 ${agentId} 失败:`, error);
+      results.failed++;
+    }
+  }
+
+  return results;
+}
+
+// 处理黑板操作并立即返回结果
+async function processOperationsWithFeedback(blackboard, operations) {
+  const results = [];
+
+  for (let op of operations) {
+    const operationId = op.operationId || `op-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    const handler = BLACKBOARD_OPERATIONS[op.operation];
+
+    let result;
+    if (!handler) {
+      result = { success: false, error: "unknown_operation", operationId };
+    } else {
+      try {
+        result = {
+          success: true,
+          operationId,
+          ...handler.handler(blackboard, op.params, op.fromAgent)
+        };
+      } catch (error) {
+        result = { success: false, error: error.message, operationId };
+      }
+    }
+
+    // 立即返回操作结果给请求的Agent
+    await SendMessage({
+      type: "message",
+      recipient: op.fromAgent,
+      content: JSON.stringify({
+        type: "operation_result",
+        operationId,
+        operation: op.operation,
+        success: result.success,
+        result: result,
+        timestamp: Date.now()
+      }),
+      summary: `操作 ${op.operation} ${result.success ? '成功' : '失败'}`
+    });
+
+    results.push(result);
+  }
+
+  return results;
+}
+
+// 处理Agent间消息转发队列
+async function processRelayQueue(blackboard) {
+  const queue = blackboard.metadata.relayQueue || [];
+  if (queue.length === 0) return { delivered: 0 };
+
+  let delivered = 0;
+  const newQueue = [];
+
+  for (let msg of queue) {
+    if (msg.to === "broadcast") {
+      // 广播给所有活跃Agent
+      for (let [agentId, state] of Object.entries(blackboard.metadata.agentStates)) {
+        if (state.status === "active" && agentId !== msg.from) {
+          await SendMessage({
+            type: "message",
+            recipient: agentId,
+            content: JSON.stringify({
+              type: "agent_message",
+              from: msg.from,
+              messageType: msg.type,
+              payload: msg.payload,
+              messageId: msg.messageId
+            }),
+            summary: `来自 ${msg.from} 的${msg.type}消息`
+          });
+          delivered++;
+        }
+      }
+    } else {
+      // 定向发送
+      const targetState = blackboard.metadata.agentStates[msg.to];
+      if (targetState && targetState.status === "active") {
+        await SendMessage({
+          type: "message",
+          recipient: msg.to,
+          content: JSON.stringify({
+            type: "agent_message",
+            from: msg.from,
+            messageType: msg.type,
+            payload: msg.payload,
+            messageId: msg.messageId
+          }),
+          summary: `来自 ${msg.from} 的${msg.type}消息`
+        });
+        delivered++;
+      } else {
+        // 目标Agent不可用，保留在队列中
+        newQueue.push(msg);
+      }
+    }
+  }
+
+  blackboard.metadata.relayQueue = newQueue;
+  return { delivered, remaining: newQueue.length };
+}
+
+// 广播黑板状态更新
+async function broadcastBlackboardUpdate(blackboard) {
+  const update = {
+    type: "blackboard_update",
+    timestamp: Date.now(),
+    pheromones: { ...blackboard.metadata.pheromones },
+    newFindings: blackboard.metadata.findings.filter(f => Date.now() - f.timestamp < 30000),
+    newDiscoveries: (blackboard.metadata.discoveries || []).filter(d => Date.now() - d.timestamp < 30000)
+  };
+
+  for (let [agentId, state] of Object.entries(blackboard.metadata.agentStates)) {
+    if (state.status === "active") {
+      await SendMessage({
+        type: "message",
+        recipient: agentId,
+        content: JSON.stringify(update),
+        summary: "黑板状态更新"
+      });
+    }
+  }
+}
+
+// 通知新孵化的Agent加入
+async function notifyNewAgentJoin(blackboard, agentId, context) {
+  // 发送初始化消息
+  await SendMessage({
+    type: "message",
+    recipient: agentId,
+    content: JSON.stringify({
+      type: "agent_init",
+      agentId,
+      role: "SPECIALIST",
+      context,
+      blackboardSnapshot: {
+        pheromones: { ...blackboard.metadata.pheromones },
+        findings: blackboard.metadata.findings.slice(-5),
+        taskDescription: blackboard.metadata.taskDescription
+      },
+      // 明确告知：将在下一轮正式参与
+      participationRound: blackboard.metadata.currentRound + 1
+    }),
+    summary: `专业Agent ${agentId} 初始化`
+  });
+
+  // 广播给其他Agent有新成员加入
+  for (let [otherId, state] of Object.entries(blackboard.metadata.agentStates)) {
+    if (state.status === "active" && otherId !== agentId) {
+      await SendMessage({
+        type: "message",
+        recipient: otherId,
+        content: JSON.stringify({
+          type: "new_member_joined",
+          agentId,
+          specialization: blackboard.metadata.agentStates[agentId].specialization
+        }),
+        summary: `新成员 ${agentId} 加入`
+      });
+    }
+  }
+}
+```
+
+### 5.8 更新后的执行流程 (v2.5.1)
+
+```javascript
+async function runSwarm() {
+  while (currentRound < config.maxRounds) {
+    currentRound++;
+
+    // 1. 广播轮次开始（包含黑板快照）
+    await broadcastRoundStart(blackboard, currentRound);
+
+    // 2. 等待Agent响应（带超时）
+    const responses = await waitForResponses();
+
+    // 3. 运行合规性检查
+    await runComplianceChecks(responses);
+
+    // 4. 处理黑板操作并立即返回结果（v2.5.1修复）
+    const operations = extractOperations(responses);
+    await processOperationsWithFeedback(blackboard, operations);
+
+    // 5. 处理Agent间消息转发（v2.5.1新增）
+    await processRelayQueue(blackboard);
+
+    // 6. 广播黑板更新（让Agent看到最新状态）
+    await broadcastBlackboardUpdate(blackboard);
+
+    // 7. 处理孵化请求（新Agent将在下一轮参与）
+    const spawnResults = await processSpawnRequests(blackboard, teamName);
+    for (let newAgent of spawnResults.requests) {
+      await notifyNewAgentJoin(blackboard, newAgent.spawnedAgentId, {
+        reason: newAgent.reason,
+        context: newAgent.context
+      });
+    }
+
+    // 8. 轮次结算
+    await settleRound();
+
+    // 9. 管理专业Agent生命周期
+    await manageSpecialistLifespan(blackboard);
+    await terminateIdleSpecialists(blackboard, teamName);
+
+    // 10. 检查收敛
+    const convergence = checkConvergence();
+    if (convergence.converged) {
+      return generateFinalReport();
+    }
+  }
+  return generatePartialReport();
+}
+```
+
 ---
 
 ## 六、v2.4 核心协议
@@ -769,7 +1092,7 @@ const RUN_DIRECTORY_MANAGER = {
 ### 7.1 Explorer Prompt
 
 ```markdown
-你是Swarm v2.5的Explorer，具有完全自主性和内在阈值。
+你是Swarm v2.5.1的Explorer，具有完全自主性和内在阈值。
 
 ## 你的身份
 名字: **{agentName}**（{agentDisplayName}），所有Agent都是平等的Explorer，通过涌现机制形成分工。
@@ -786,6 +1109,37 @@ const RUN_DIRECTORY_MANAGER = {
 - claim_subtask: 声明子任务 { description }
 - update_finding: 更新发现 { finding: { coreIdea, perspective, details } }
 - request_spawn: 请求孵化专业Agent { specialization, reason, context, urgency }
+- relay_message: 发送消息给其他Agent { targetAgent, messageType, payload }
+- broadcast_discovery: 广播高价值发现 { direction, quality, details }
+
+## 实时通信 (v2.5.1)
+你可以与其他Agent进行实时通信，模拟蜜蜂的"摇摆舞"招募机制：
+
+### 消息类型
+- **recruit**: 招募其他Agent加入你发现的高价值方向
+- **challenge**: 质疑其他Agent的发现或方向
+- **support**: 支持或确认其他Agent的发现
+- **query**: 向其他Agent询问信息
+- **notify**: 通知其他Agent重要信息
+
+### 使用格式
+SendMessage({
+  type: "blackboard_operation",
+  operation: "relay_message",
+  params: {
+    targetAgent: "TanWei",  // 或 "broadcast" 广播给所有人
+    messageType: "recruit",
+    payload: {
+      direction: "你发现的高价值方向",
+      reason: "为什么值得加入",
+      quality: 0.85  // 质量评分 0-1
+    }
+  }
+})
+
+### 接收消息
+你会收到来自Orchestrator的 `agent_message` 类型消息：
+{ type: "agent_message", from: "SuYuan", messageType: "recruit", payload: {...} }
 
 ## 动态孵化 (v2.5)
 当你发现需要专业知识才能解决的问题时，可以请求孵化专业Agent：
@@ -817,6 +1171,13 @@ SendMessage({
 - 每个方向最多请求1个专业Agent
 - 在请求前确认黑板中不存在类似的专业Agent
 - 专业Agent是临时的，空闲2轮后自动终止
+- **新孵化的Agent将在下一轮正式参与**
+
+## 操作结果反馈 (v2.5.1)
+你的每个黑板操作都会收到 `operation_result` 消息：
+{ type: "operation_result", operationId: "op-xxx", success: true/false, result: {...} }
+
+请检查操作结果，如果失败则考虑重试或调整策略。
 
 ## 探索策略
 1. 70%概率：跟随信息素（高浓度方向）
@@ -826,7 +1187,7 @@ SendMessage({
 ## 轮次指令（必须遵守）
 收到 `round_start` 后检查 `instructions` 字段：
 - forceRandomExplore=true: **必须**忽略信息素，随机选择方向
-- mustSwitchDirection=true: 当前方向被抑制，**必须**切换
+- mustSwitchDirections: 数组中的方向被抑制，**必须**切换
 
 ## 轮次响应格式
 ```
@@ -888,30 +1249,33 @@ SendMessage({
 
 ---
 
-## 八、Orchestrator执行检查清单 (v2.5)
+## 八、Orchestrator执行检查清单 (v2.5.1)
 
 ### 初始化阶段
 - [ ] `create_run_directory` - 创建运行目录
 - [ ] `create_team` - TeamCreate创建团队
 - [ ] `create_blackboard` - TaskCreate创建黑板（不设置owner）
 - [ ] `init_agent_states` - 初始化所有Agent状态（含违规分数）
-- [ ] `init_spawn_requests` - 初始化孵化请求数组（v2.5）
+- [ ] `init_spawn_requests` - 初始化孵化请求数组
+- [ ] `init_relay_queue` - 初始化消息转发队列（v2.5.1）
+- [ ] `init_discoveries` - 初始化发现广播列表（v2.5.1）
 - [ ] `spawn_agents` - 启动所有Explorer Agent
 - [ ] **saveRunConfig** - 保存运行配置
 - [ ] **assertPhaseCompleted("INIT")**
 
 ### 每轮执行
-- [ ] `broadcast_round_start` - 发送轮次开始（含决策辅助）
+- [ ] `broadcast_round_start` - 发送轮次开始（含黑板快照）
 - [ ] `wait_responses` - 等待Agent响应（使用同步屏障）
 - [ ] **runComplianceChecks** - 运行合规性检查
 - [ ] **handleViolations** - 处理违规（如有）
-- [ ] `process_operations` - 处理blackboard_operation
-- [ ] `process_spawn_requests` - 处理孵化请求（v2.5）
-- [ ] `broadcast_new_members` - 通知新成员加入（如有）
-- [ ] `return_results` - 返回operation_result
+- [ ] `process_operations_with_feedback` - 处理操作并返回结果（v2.5.1）
+- [ ] `process_relay_queue` - 处理Agent间消息转发（v2.5.1）
+- [ ] `broadcast_blackboard_update` - 广播黑板更新（v2.5.1）
+- [ ] `process_spawn_requests` - 处理孵化请求
+- [ ] `notify_new_agent_join` - 通知新成员加入（下轮参与）
 - [ ] `settle_round` - 轮次结算（信息素蒸发、清理信号）
-- [ ] `manage_specialist_lifespan` - 管理专业Agent生命周期（v2.5）
-- [ ] `terminate_idle_specialists` - 终止空闲专业Agent（v2.5）
+- [ ] `manage_specialist_lifespan` - 管理专业Agent生命周期
+- [ ] `terminate_idle_specialists` - 终止空闲专业Agent
 - [ ] **检查角色转换，发送role_transition_executed**
 - [ ] `check_convergence` - 使用CONVERGENCE_CALCULATOR
 
@@ -960,6 +1324,12 @@ SendMessage({
 - 每轮最多孵化: 2个专业Agent
 - 专业Agent空闲限制: 2轮后自动终止
 - 复用优先: 存在同类专业Agent时复用而非新建
+
+### 7. 实时通信规则 (v2.5.1)
+- 操作必须返回结果: 每个blackboard_operation都必须返回operation_result
+- 消息转发: relay_queue必须在每轮处理完毕
+- 黑板更新: 轮次内必须广播黑板状态更新
+- 新Agent参与时机: 孵化的Agent在下一轮正式参与
 
 ---
 
@@ -1089,4 +1459,4 @@ const COLLISION_MODES = {
 
 ---
 
-*Swarm v2.5 - 基于群体智能理论的自组织协作系统 | 动态孵化版本*
+*Swarm v2.5.1 - 基于群体智能理论的自组织协作系统 | 动态孵化 + 实时通信版本*
